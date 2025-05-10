@@ -19,6 +19,7 @@ module.exports = (sequelize, DataTypes) => {
       type: DataTypes.STRING(100),
       allowNull: false,
       comment: '코드 값 (예: EASY, MEDIUM)',
+      index: true,
     },
     name: {
       type: DataTypes.STRING(100),
@@ -39,6 +40,11 @@ module.exports = (sequelize, DataTypes) => {
     tableName: 'codes',
     timestamps: true,
     createdAt: 'created_at',
-    updatedAt: 'updated_at',
+    updatedAt: 'updated_at', 
+    indexes: [
+      {
+        fields: ['code']
+      }
+    ]
   });
 }

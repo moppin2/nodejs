@@ -46,7 +46,7 @@ exports.login = async (req, res) => {
     res
       .cookie('accessToken', accessToken, { httpOnly: true, secure: COOKIE_SECURE, sameSite: 'Lax', maxAge: 5 * 60 * 1000 })
       .cookie('refreshToken', refreshToken, { httpOnly: true, secure: COOKIE_SECURE, sameSite: 'Lax', maxAge: 7 * 24 * 60 * 60 * 1000 })
-      .json({ userType, email: user.email, username: user.name });
+      .json({ userType, id: user.id, email: user.email, username: user.name }); 
 
   } catch (err) {
     console.error(err);
@@ -158,11 +158,16 @@ exports.registerUser = async (req, res) => {
 
     const pwd_hash = await bcrypt.hash(password, 10);
     const user = await User.create({ email, pwd_hash, name, phone_number: phone });
-    return res.status(201).json({ message: '회원가입 성공', userId: user.id });
+  
+    user.userType = 'user'; // ✅ 토큰 발급용
+    await login(req, res, user); // ✅ 로그인 처리
+
+    // return res.status(201).json({ message: '회원가입 성공', userId: user.id });
   } catch (err) {
     console.error(err);
     res.status(500).json({ message: '서버 오류' });
   }
+
 };
 
 exports.registerInstructor = async (req, res) => {
@@ -182,9 +187,51 @@ exports.registerInstructor = async (req, res) => {
       comment: introduction,
       joined_at: new Date().toISOString()
     });
-    return res.status(201).json({ message: '강사회원 가입 성공', instructorId: instructor.id });
+    
+    instructor.userType = 'instructor'; // ✅ 토큰 발급용
+    await login(req, res, instructor); // ✅ 로그인 처리
+
+    // return res.status(201).json({ message: '강사회원 가입 성공', instructorId: instructor.id });
   } catch (err) {
     console.error(err);
     res.status(500).json({ message: '서버 오류' });
   }
 };
+
+const login = async (req, res, user) => {
+  // const userType = user.userType; // ✅ 직접 추출
+
+  const accessToken = signAccessToken(user);
+  const refreshToken = signRefreshToken(user);
+
+  await RefreshToken.upsert({
+    user_id: user.id,
+    user_type: user.userType,
+    token: refreshToken,
+    user_agent: req.headers['user-agent'],
+    ip_address: req.ip,
+    expires_at: new Date(Date.now() + 7 * 24 * 60 * 60 * 1000) // 7일
+  });
+
+  res
+    .cookie('accessToken', accessToken, {
+      httpOnly: true,
+      secure: COOKIE_SECURE,
+      sameSite: 'Lax',
+      maxAge: 5 * 60 * 1000
+    })
+    .cookie('refreshToken', refreshToken, {
+      httpOnly: true,
+      secure: COOKIE_SECURE,
+      sameSite: 'Lax',
+      maxAge: 7 * 24 * 60 * 60 * 1000
+    })
+    .status(201)
+    .json({
+      message: '회원가입 및 로그인 성공',
+      userType: user.userType,
+      email: user.email,
+      username: user.name
+    });
+};
+

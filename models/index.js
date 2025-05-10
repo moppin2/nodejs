@@ -19,6 +19,8 @@ db.CourseCompletionCriteria = require('./CourseCompletionCriteria')(sequelize, D
 db.RefreshToken = require('./RefreshToken')(sequelize, DataTypes);
 db.CodeGroup = require('./CodeGroup')(sequelize, DataTypes);
 db.Code = require('./Code')(sequelize, DataTypes);
+db.UploadFile = require('./UploadFile')(sequelize, DataTypes);
+db.License = require('./License')(sequelize, DataTypes);
 
 // 관계 정의
 db.Course.belongsTo(db.Instructor, { foreignKey: 'instructor_id', as: 'instructor' });
@@ -30,6 +32,21 @@ db.CourseCompletionCriteria.belongsTo(db.Course, { foreignKey: 'course_id', as: 
 db.CodeGroup.hasMany(db.Code, { foreignKey: 'group_code', sourceKey: 'group_code', as: 'codes' });
 db.Code.belongsTo(db.CodeGroup, { foreignKey: 'group_code', targetKey: 'group_code', as: 'group' });
 
+db.Course.belongsTo(db.License, {
+  foreignKey: 'license_id',
+  as: 'license',
+});
+db.Course.belongsTo(db.Code, {
+  foreignKey: 'level_code',
+  targetKey: 'code',
+  as: 'level',
+});
+db.Course.belongsTo(db.Code, {
+  foreignKey: 'region_code',
+  targetKey: 'code',
+  as: 'region',
+});
+
 // 필요 시 RefreshToken ↔ User 관계도 여기에
 
-module.exports = db;
+module.exports = db; 

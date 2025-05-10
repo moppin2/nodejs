@@ -14,19 +14,25 @@ module.exports = (sequelize, DataTypes) => {
       },
       onDelete: 'SET NULL',
     },
-    title: {
-      type: DataTypes.STRING(100),
-      allowNull: true,
-    },
-    association_code: {
-      type: DataTypes.STRING(100),
-      allowNull: true,
+    license_id: {
+      type: DataTypes.STRING(50),
+      allowNull: false,
+      references: {
+        model: 'licenses',
+        key: 'id',
+      },
+      onDelete: 'RESTRICT',
+      comment: '해당 과정이 대응하는 라이센스 ID',
     },
     level_code: {
       type: DataTypes.STRING(100),
       allowNull: true,
     },
     region_code: {
+      type: DataTypes.STRING(100),
+      allowNull: true,
+    },
+    title: {
       type: DataTypes.STRING(100),
       allowNull: true,
     },

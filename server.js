@@ -7,7 +7,9 @@ const db = require('./models')
 
 const authRoutes = require('./routes/authRoutes');
 const courseRoutes = require('./routes/courseRoutes');
-const codeRoutes = require('./routes/codeRoutes'); 
+const codeRoutes = require('./routes/codeRoutes');
+const uploadRoutes = require('./routes/uploadRoutes');
+const licenseRoutes = require('./routes/licenseRoutes');
 
 const app = express();
 
@@ -21,6 +23,8 @@ app.use(cookieParser());
 app.use('/', authRoutes);
 app.use('/', courseRoutes);
 app.use('/', codeRoutes);
+app.use('/', uploadRoutes);
+app.use('/', licenseRoutes);
 
 // ✅ 서버 실행 전에 DB 동기화
 (async () => {
