@@ -87,6 +87,14 @@ const getUploadList = async (req, res) => {
       return res.status(400).json({ message: '필수 쿼리 누락' });
     }
 
+    // if (req.user.userType === 'user') {
+    //   return res.status(400).json({ message: '알반회원은 권한이 없습니다.' });
+    // }
+
+    if (req.user.userType === 'instructor' && req.user.id != Number(target_id)) {
+      return res.status(400).json({ message: '본인 자료만 조회 가능합니다.' });
+    }
+
     const list = await UploadFile.findAll({
       where: { target_type, target_id, purpose },
       order: [['created_at', 'DESC']]

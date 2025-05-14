@@ -1,10 +1,7 @@
-const { Course, CourseCompletionCriteria, UploadFile, License, Code, Instructor } = require('../models');
+const { Course, CourseCompletionCriteria, UploadFile, License, Code, Instructor, CourseApplication, CourseApplicationHistory } = require('../models');
 const { Op } = require('sequelize');
 
 exports.upsertCourse = async (req, res) => {
-  if (!req.user || req.user.userType !== 'instructor') {
-    return res.status(403).json({ message: '강사만 과정 등록이 가능합니다.' });
-  }
 
   try {
     const {
@@ -15,7 +12,8 @@ exports.upsertCourse = async (req, res) => {
       region_code,
       curriculum,
       description,
-      instructor_id,
+      instructor_id = req.user.id,
+      is_published,
       criteriaList = [],
       file_keys = [],
     } = req.body;
@@ -28,9 +26,11 @@ exports.upsertCourse = async (req, res) => {
       if (!course) return res.status(404).json({ message: '과정을 찾을 수 없습니다.' });
 
       // ✅ 소유자 확인 (선택적: 내 강의만 수정 가능하도록)
-      if (course.instructor_id !== instructor_id) {
+      if (course.instructor_id !== req.user.id) {
         return res.status(403).json({ message: '본인의 과정만 수정할 수 있습니다.' });
       }
+
+      // 완료된 수료기준이 있는 경우 로직 처리(개발할 것)
 
       await course.update({
         title,
@@ -39,11 +39,12 @@ exports.upsertCourse = async (req, res) => {
         region_code,
         curriculum,
         description,
-        instructor_id
+        instructor_id,
+        is_published
       });
 
-      // 기존 수료 기준 삭제
-      await CourseCompletionCriteria.destroy({ where: { course_id: id } });
+      // 기존 수료 기준 업데이트
+      await updateCompletionCriteria(id, criteriaList);
 
       // 기존 사진파일 연결해제
       await UploadFile.update(
@@ -66,18 +67,19 @@ exports.upsertCourse = async (req, res) => {
         region_code,
         curriculum,
         description,
-        instructor_id
+        instructor_id,
+        is_published
       });
-    }
 
-    // 수료 기준 삽입
-    if (criteriaList.length > 0) {
-      const values = criteriaList.map(c => ({
-        course_id: course.id,
-        type: c.type,
-        value: c.value
-      }));
-      await CourseCompletionCriteria.bulkCreate(values);
+      // 수료 기준 삽입
+      if (criteriaList.length > 0) {
+        const values = criteriaList.map(c => ({
+          course_id: course.id,
+          type: c.type,
+          value: c.value
+        }));
+        await CourseCompletionCriteria.bulkCreate(values);
+      }
     }
 
     // 업로드 파일 id 업데이트
@@ -97,44 +99,60 @@ exports.upsertCourse = async (req, res) => {
 
 exports.getCourseList = async (req, res) => {
   try {
-    const { instructor_id } = req.query;
-    const where = {};
+    const {
+      instructor_id,
+      association_code,
+      license_id,
+      level_code,
+      region_code,
+      course_title,
+      instructor_name,
+    } = req.query;
 
+    const whereClause = {};
     if (instructor_id) {
-      where.instructor_id = instructor_id;
+      whereClause.instructor_id = instructor_id;
+    } else {
+      whereClause.is_published = true;
     }
+    if (license_id) whereClause.license_id = license_id;
+    if (level_code) whereClause.level_code = level_code;
+    if (region_code) whereClause.region_code = region_code;
+    if (course_title) whereClause.title = { [Op.like]: `%${course_title}%` };
 
-    const courses = await Course.findAll({
-      where,
-      include: [
-        {
-          model: Instructor,
-          as: 'instructor',
-          attributes: ['name']
-        },
-        {
-          model: License,
-          as: 'license',
-          attributes: ['association', 'name'],
-        },
-        {
-          model: Code,
-          as: 'level',
-          attributes: ['name'],
-          where: { group_code: 'LEVEL' },
-          required: false,
-        },
-        {
-          model: Code,
-          as: 'region',
-          attributes: ['name'],
-          where: { group_code: 'REGION' },
-          required: false,
-        },
-      ],
-    });
+    const include = [
+      {
+        model: Instructor,
+        as: 'instructor',
+        attributes: ['name'],
+        where: instructor_name ? { name: { [Op.like]: `%${instructor_name}%` } } : undefined,
+        required: !!instructor_name,
+      },
+      {
+        model: License,
+        as: 'license',
+        attributes: ['association', 'name'],
+        where: association_code ? { association: association_code } : undefined,
+      },
+      {
+        model: Code,
+        as: 'level',
+        attributes: ['name'],
+        where: { group_code: 'LEVEL' },
+        required: false,
+      },
+      {
+        model: Code,
+        as: 'region',
+        attributes: ['name'],
+        where: { group_code: 'REGION' },
+        required: false,
+      },
+    ];
 
-    const courseIds = courses.map((c) => c.id);
+    const courses = await Course.findAll({ where: whereClause, include });
+
+    const courseIds = courses.map(c => c.id);
 
     const thumbnails = await UploadFile.findAll({
       where: {
@@ -145,13 +163,13 @@ exports.getCourseList = async (req, res) => {
       },
     });
 
-    const thumbnailMap = {};
     const bucket = process.env.UPLOAD_BUCKET;
-    thumbnails.forEach((f) => {
+    const thumbnailMap = {};
+    thumbnails.forEach(f => {
       thumbnailMap[f.target_id] = `https://${bucket}.s3.amazonaws.com/${f.file_key}`;
     });
 
-    const result = courses.map((c) => ({
+    const result = courses.map(c => ({
       id: c.id,
       title: c.title,
       thumbnail_url: thumbnailMap[c.id] || null,
@@ -236,6 +254,7 @@ exports.getCourseDetail = async (req, res) => {
       license_association: course.license?.association,
       level_name: course.level?.name,
       region_name: course.region?.name,
+      is_published: course.is_published,
       criteriaList,
       coverImageKey: coverImage?.file_key || null,
       coverImageUrl: coverImage ? `https://${bucket}.s3.amazonaws.com/${coverImage.file_key}` : null,
@@ -250,3 +269,99 @@ exports.getCourseDetail = async (req, res) => {
     res.status(500).json({ message: '서버 오류' });
   }
 };
+
+const updateCompletionCriteria = async (courseId, criteriaList) => {
+  // 1. 기존 기준 불러오기
+  const existing = await CourseCompletionCriteria.findAll({
+    where: { course_id: courseId }
+  });
+
+  const existingIds = existing.map(c => c.id);
+  const newIds = criteriaList.filter(c => c.id).map(c => c.id);
+
+  // 2. 삭제 대상 = 기존에 있었는데 요청에는 없는 것
+  const toDelete = existingIds.filter(id => !newIds.includes(id));
+
+  if (toDelete.length > 0) {
+    await CourseCompletionCriteria.destroy({
+      where: { id: toDelete }
+    });
+  }
+
+  // 4. 수정
+  const toUpdate = criteriaList.filter(c => c.id && existingIds.includes(c.id));
+  for (const item of toUpdate) {
+    await CourseCompletionCriteria.update(
+      { type: item.type, value: item.value },
+      { where: { id: item.id } }
+    );
+  }
+
+  // 5. 추가
+  const toCreate = criteriaList.filter(c => !c.id);
+  if (toCreate.length > 0) {
+    await CourseCompletionCriteria.bulkCreate(
+      toCreate.map(c => ({
+        course_id: courseId,
+        type: c.type,
+        value: c.value
+      }))
+    );
+  }
+};
+
+exports.applyToCourse = async (req, res) => {
+  if (!req.user || req.user.userType !== 'user') {
+    return res.status(403).json({ message: '학생만 수강 신청할 수 있습니다.' });
+  }
+
+  const { course_id } = req.body;
+  const user_id = req.user.id;
+
+  if (!course_id) {
+    return res.status(400).json({ message: 'course_id는 필수입니다.' });
+  }
+
+  try {
+    const course = await Course.findByPk(course_id);
+    if (!course || !course.is_published) {
+      return res.status(404).json({ message: '존재하지 않거나 비공개인 과정입니다.' });
+    }
+
+    // 중복 신청 방지: 신청 중 또는 승인 상태인 경우
+    const existing = await CourseApplication.findOne({
+      where: {
+        course_id,
+        user_id,
+        status: ['applied', 'approved']
+      }
+    });
+
+    if (existing) {
+      return res.status(409).json({ message: '이미 신청한 과정입니다.' });
+    }
+
+    // 신청 저장
+    const application = await CourseApplication.create({
+      course_id,
+      user_id,
+      status: 'applied'
+    });
+
+    // 이력 저장
+    await CourseApplicationHistory.create({
+      application_id: application.id,
+      action: 'apply',
+      performed_by: user_id,
+      performer_type: 'user',
+      reason: null
+    });
+
+    return res.status(200).json({ message: '수강 신청이 완료되었습니다.' });
+  } catch (err) {
+    console.error('수강 신청 오류:', err);
+    return res.status(500).json({ message: '서버 오류' });
+  }
+};
+
+

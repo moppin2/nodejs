@@ -44,6 +44,12 @@ module.exports = (sequelize, DataTypes) => {
       type: DataTypes.TEXT,
       allowNull: true,
     },
+    is_published: {
+      type: DataTypes.BOOLEAN,
+      allowNull: false,
+      defaultValue: false, // 기본값은 비공개
+      comment: '공개 여부 (true: 공개, false: 비공개)'
+    },
   }, {
     tableName: 'courses',
     timestamps: true,

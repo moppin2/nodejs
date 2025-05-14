@@ -14,6 +14,7 @@ db.Sequelize = Sequelize;
 // 모델 불러오기
 db.User = require('./User')(sequelize, DataTypes);
 db.Instructor = require('./Instructor')(sequelize, DataTypes);
+db.Admin = require('./Admin')(sequelize, DataTypes);
 db.Course = require('./Course')(sequelize, DataTypes);
 db.CourseCompletionCriteria = require('./CourseCompletionCriteria')(sequelize, DataTypes);
 db.RefreshToken = require('./RefreshToken')(sequelize, DataTypes);
@@ -21,6 +22,9 @@ db.CodeGroup = require('./CodeGroup')(sequelize, DataTypes);
 db.Code = require('./Code')(sequelize, DataTypes);
 db.UploadFile = require('./UploadFile')(sequelize, DataTypes);
 db.License = require('./License')(sequelize, DataTypes);
+db.InstructorVerificationHistory = require('./InstructorVerificationHistory')(sequelize, DataTypes);
+db.CourseApplication = require('./CourseApplication')(sequelize, DataTypes);
+db.CourseApplicationHistory = require('./CourseApplicationHistory')(sequelize, DataTypes);
 
 // 관계 정의
 db.Course.belongsTo(db.Instructor, { foreignKey: 'instructor_id', as: 'instructor' });
@@ -46,7 +50,5 @@ db.Course.belongsTo(db.Code, {
   targetKey: 'code',
   as: 'region',
 });
-
-// 필요 시 RefreshToken ↔ User 관계도 여기에
 
 module.exports = db; 

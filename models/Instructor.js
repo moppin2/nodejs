@@ -6,6 +6,11 @@ module.exports = (sequelize, DataTypes) => {
     name: { type: DataTypes.STRING(100), allowNull: false },
     phone_number: { type: DataTypes.STRING(20), allowNull: false },
     joined_at: { type: DataTypes.STRING(100) },
+    status: {
+      type: DataTypes.ENUM('draft', 'submitted', 'approved', 'rejected'),
+      allowNull: false,
+      defaultValue: 'draft'
+    },
     approved_at: { type: DataTypes.STRING(100) },
     career_years: { type: DataTypes.STRING(100) },
     main_experience: { type: DataTypes.STRING(100) },

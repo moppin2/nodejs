@@ -3,7 +3,9 @@ const { signAccessToken, signRefreshToken } = require('../utils/token');
 const { REFRESH_SECRET, COOKIE_SECURE } = require('../config');
 
 const bcrypt = require('bcrypt');
-const { User, Instructor, RefreshToken } = require('../models');
+const { User, Instructor, Admin, RefreshToken, InstructorVerificationHistory } = require('../models');
+const { UploadFile } = require('../models');
+const { Op } = require('sequelize');
 
 exports.login = async (req, res) => {
   try {
@@ -15,6 +17,8 @@ exports.login = async (req, res) => {
       user = await User.findOne({ where: { email } });
     } else if (userType === 'instructor') {
       user = await Instructor.findOne({ where: { email } });
+    } else if (userType === 'admin') {
+      user = await Admin.findOne({ where: { email } });
     } else {
       return res.status(400).json({ message: '잘못된 사용자 유형입니다.' });
     }
@@ -30,6 +34,7 @@ exports.login = async (req, res) => {
     }
 
     user.userType = userType;
+    user.username = user.name;
 
     const accessToken = signAccessToken(user);      // 토큰 생성 시 userType도 포함되게 하면 좋음
     const refreshToken = signRefreshToken(user);
@@ -46,7 +51,7 @@ exports.login = async (req, res) => {
     res
       .cookie('accessToken', accessToken, { httpOnly: true, secure: COOKIE_SECURE, sameSite: 'Lax', maxAge: 5 * 60 * 1000 })
       .cookie('refreshToken', refreshToken, { httpOnly: true, secure: COOKIE_SECURE, sameSite: 'Lax', maxAge: 7 * 24 * 60 * 60 * 1000 })
-      .json({ userType, id: user.id, email: user.email, username: user.name }); 
+      .json({ userType, id: user.id, email: user.email, username: user.name, status: user.status });
 
   } catch (err) {
     console.error(err);
@@ -81,6 +86,8 @@ exports.refresh = async (req, res) => {
     user = await User.findByPk(id);
   } else if (userType === 'instructor') {
     user = await Instructor.findByPk(id);
+  } else if (userType === 'admin') {
+    user = await Admin.findByPk(id);
   }
 
   if (!user) return res.status(404).json({ message: '사용자 없음' });
@@ -90,13 +97,19 @@ exports.refresh = async (req, res) => {
     id: user.id,
     userType,
     username: user.name,
-    email: user.email
+    email: user.email,
+    status: user.status,
   });
 
   const newRefresh = signRefreshToken({ id: user.id, userType });
 
   // 4. DB 갱신
-  await RefreshToken.upsert({
+  const found = await RefreshToken.findOne({ where: { token } });
+
+  const deleted = await RefreshToken.destroy({ 
+    where: { user_id: user.id, user_type: userType, token: token } 
+  });
+  await RefreshToken.create({
     user_id: user.id,
     user_type: userType,
     token: newRefresh,
@@ -113,7 +126,7 @@ exports.refresh = async (req, res) => {
 };
 
 exports.logout = async (req, res) => {
-  
+
   const token = req.cookies.refreshToken;
   if (!token) {
     return res
@@ -150,7 +163,7 @@ exports.me = (req, res) => {
   res.json(req.user);
 };
 
-exports.registerUser = async (req, res) => {  
+exports.registerUser = async (req, res) => {
   try {
     const { email, password, name, phone } = req.body;
     const existing = await User.findOne({ where: { email } });
@@ -158,7 +171,7 @@ exports.registerUser = async (req, res) => {
 
     const pwd_hash = await bcrypt.hash(password, 10);
     const user = await User.create({ email, pwd_hash, name, phone_number: phone });
-  
+
     user.userType = 'user'; // ✅ 토큰 발급용
     await login(req, res, user); // ✅ 로그인 처리
 
@@ -187,11 +200,10 @@ exports.registerInstructor = async (req, res) => {
       comment: introduction,
       joined_at: new Date().toISOString()
     });
-    
-    instructor.userType = 'instructor'; // ✅ 토큰 발급용
-    await login(req, res, instructor); // ✅ 로그인 처리
 
-    // return res.status(201).json({ message: '강사회원 가입 성공', instructorId: instructor.id });
+    instructor.userType = 'instructor';
+    instructor.status = 'draft';
+    await login(req, res, instructor); // ✅ 로그인 처리
   } catch (err) {
     console.error(err);
     res.status(500).json({ message: '서버 오류' });
@@ -199,8 +211,6 @@ exports.registerInstructor = async (req, res) => {
 };
 
 const login = async (req, res, user) => {
-  // const userType = user.userType; // ✅ 직접 추출
-
   const accessToken = signAccessToken(user);
   const refreshToken = signRefreshToken(user);
 
@@ -229,9 +239,179 @@ const login = async (req, res, user) => {
     .status(201)
     .json({
       message: '회원가입 및 로그인 성공',
-      userType: user.userType,
+      userType: user.userType, 
+      id: user.id,
       email: user.email,
-      username: user.name
+      username: user.name,
+      status: user.status
     });
 };
 
+resetInstructorVerificationFiles = async (instructor_id, file_keys = []) => {
+  // 1. 기존 연결 해제
+  await UploadFile.update(
+    { target_id: null },
+    {
+      where: {
+        target_type: 'instructor',
+        target_id: instructor_id,
+        purpose: 'verification'
+      }
+    }
+  );
+
+  // 2. 전달된 파일만 다시 연결
+  if (file_keys.length > 0) {
+    await UploadFile.update(
+      { target_id: instructor_id },
+      {
+        where: {
+          file_key: { [Op.in]: file_keys },
+          target_type: 'instructor',
+          purpose: 'verification'
+        }
+      }
+    );
+  }
+};
+
+exports.updateInstructorVerificationFiles = async (req, res) => {
+  // if (!req.user || req.user.userType !== 'instructor') {
+  //   return res.status(403).json({ message: '강사만 임시 저장이 가능합니다.' });
+  // }
+
+  const { instructor_id, file_keys = [] } = req.body;
+
+  if (!instructor_id) {
+    return res.status(400).json({ message: 'instructor_id는 필수입니다.' });
+  }
+
+  if (req.user.id !== instructor_id) {
+    return res.status(403).json({ message: '본인의 파일만 임시 저장할 수 있습니다.' });
+  }
+
+  try {
+
+    const instructor = await Instructor.findByPk(instructor_id);
+    if (!instructor) return res.status(404).json({ message: '강사를 찾을 수 없습니다.' });
+
+    // if (!['draft', 'rejected'].includes(instructor.status)) {
+    //   return res.status(400).json({ message: '현재 상태에서는 임시 저장이 불가능합니다.' });
+    // }
+
+    await resetInstructorVerificationFiles(instructor_id, file_keys);
+    res.status(200).json({ message: '파일 임시 저장이 완료되었습니다.' });
+  } catch (err) {
+    console.error('임시 저장 오류:', err);
+    res.status(500).json({ message: '서버 오류' });
+  }
+};
+
+exports.submitInstructorVerification = async (req, res) => {
+  // if (!req.user || req.user.userType !== 'instructor') {
+  //   return res.status(403).json({ message: '강사만 제출할 수 있습니다.' });
+  // }
+
+  const { instructor_id, file_keys = [] } = req.body;
+
+  if (!instructor_id) {
+    return res.status(400).json({ message: 'instructor_id는 필수입니다.' });
+  }
+
+  if (req.user.id !== instructor_id) {
+    return res.status(403).json({ message: '본인만 제출할 수 있습니다.' });
+  }
+
+  try {
+    const instructor = await Instructor.findByPk(instructor_id);
+    if (!instructor) return res.status(404).json({ message: '강사를 찾을 수 없습니다.' });
+
+    // if (!['draft', 'rejected'].includes(instructor.status)) {
+    //   return res.status(400).json({ message: '현재 상태에서는 제출이 불가능합니다.' });
+    // }
+
+    await resetInstructorVerificationFiles(instructor_id, file_keys);
+
+    await instructor.update({ status: 'submitted' });
+
+    await InstructorVerificationHistory.create({
+      instructor_id,
+      action: 'submitted',
+      performed_by: req.user.id,
+      performer_type: 'instructor',
+      reason: null,
+    });
+
+    res.status(200).json({ message: '제출 완료' });
+  } catch (err) {
+    console.error('제출 오류:', err);
+    res.status(500).json({ message: '서버 오류' });
+  }
+};
+
+
+exports.getInstructorById = async (req, res) => {
+  try {
+    const instructor = await Instructor.findByPk(req.params.id);
+    if (!instructor) {
+      return res.status(404).json({ message: '강사를 찾을 수 없습니다.' });
+    }
+    res.json(instructor);
+  } catch (err) {
+    console.error('강사 조회 오류:', err);
+    res.status(500).json({ message: '서버 오류' });
+  }
+};
+
+exports.updateInstructorStatus = async (req, res) => {
+  // if (req.user.userType !== 'admin') {
+  //   return res.status(403).json({ message: '관리자만 승인/반려 가능합니다.' });
+  // }
+
+  try {
+    const instructor = await Instructor.findByPk(req.params.id);
+    if (!instructor) return res.status(404).json({ message: '강사를 찾을 수 없습니다.' });
+
+    const { status, reason } = req.body;
+
+    if (!['approved', 'rejected'].includes(status)) {
+      return res.status(400).json({ message: '허용되지 않은 상태입니다.' });
+    }
+
+    if (instructor.status !== 'submitted') {
+      return res.status(400).json({ message: '제출된 상태가 아니므로 승인 또는 반려할 수 없습니다.' });
+    }
+
+    await instructor.update({ status });
+
+    await InstructorVerificationHistory.create({
+      instructor_id: instructor.id,
+      action: status,
+      performed_by: req.user.id,
+      performer_type: 'admin',
+      reason: status === 'rejected' ? reason || null : null,
+    });
+
+    res.json({ message: '상태가 업데이트되었습니다.' });
+  } catch (err) {
+    console.error('강사 상태 변경 오류:', err);
+    res.status(500).json({ message: '서버 오류' });
+  }
+};
+
+
+exports.getInstructorVerificationHistory = async (req, res) => {
+  const instructorId = req.params.id;
+
+  try {
+    const history = await InstructorVerificationHistory.findAll({
+      where: { instructor_id: instructorId },
+      order: [['created_at', 'DESC']],
+    });
+
+    res.status(200).json(history);
+  } catch (err) {
+    console.error('심사 이력 조회 오류:', err);
+    res.status(500).json({ message: '서버 오류' });
+  }
+};
