@@ -34,7 +34,19 @@ exports.login = async (req, res) => {
     }
 
     user.userType = userType;
-    user.username = user.name;
+    user.username = user.name;    
+
+  const avatarFile = await UploadFile.findOne({
+    where: {
+      target_type: userType,
+      target_id: user.id,
+      purpose: 'profile',
+      is_public: true,   // 필요 없으면 제거하세요
+    }
+  });
+  
+  const bucket = process.env.UPLOAD_BUCKET;
+  user.avatarUrl = avatarFile?.file_key ? `https://${bucket}.s3.amazonaws.com/${avatarFile.file_key}` : null;
 
     const accessToken = signAccessToken(user);      // 토큰 생성 시 userType도 포함되게 하면 좋음
     const refreshToken = signRefreshToken(user);
@@ -51,7 +63,7 @@ exports.login = async (req, res) => {
     res
       .cookie('accessToken', accessToken, { httpOnly: true, secure: COOKIE_SECURE, sameSite: 'Lax', maxAge: 5 * 60 * 1000 })
       .cookie('refreshToken', refreshToken, { httpOnly: true, secure: COOKIE_SECURE, sameSite: 'Lax', maxAge: 7 * 24 * 60 * 60 * 1000 })
-      .json({ userType, id: user.id, email: user.email, username: user.name, status: user.status });
+      .json({ userType, id: user.id, email: user.email, username: user.name, avatarUrl: user.avatarUrl, status: user.status });
 
   } catch (err) {
     console.error(err);
@@ -92,12 +104,25 @@ exports.refresh = async (req, res) => {
 
   if (!user) return res.status(404).json({ message: '사용자 없음' });
 
+  const avatarFile = await UploadFile.findOne({
+    where: {
+      target_type: userType,
+      target_id: user.id,
+      purpose: 'profile',
+      is_public: true,   // 필요 없으면 제거하세요
+    }
+  });
+  
+  const bucket = process.env.UPLOAD_BUCKET;
+  user.avatarUrl = avatarFile?.file_key ? `https://${bucket}.s3.amazonaws.com/${avatarFile.file_key}` : null;
+
   // 3. 새 토큰 발급
   const newAccess = signAccessToken({
     id: user.id,
     userType,
     username: user.name,
     email: user.email,
+    avatarUrl: user.avatarUrl,
     status: user.status,
   });
 
@@ -106,8 +131,8 @@ exports.refresh = async (req, res) => {
   // 4. DB 갱신
   const found = await RefreshToken.findOne({ where: { token } });
 
-  const deleted = await RefreshToken.destroy({ 
-    where: { user_id: user.id, user_type: userType, token: token } 
+  const deleted = await RefreshToken.destroy({
+    where: { user_id: user.id, user_type: userType, token: token }
   });
   await RefreshToken.create({
     user_id: user.id,
@@ -239,7 +264,7 @@ const login = async (req, res, user) => {
     .status(201)
     .json({
       message: '회원가입 및 로그인 성공',
-      userType: user.userType, 
+      userType: user.userType,
       id: user.id,
       email: user.email,
       username: user.name,

@@ -9,6 +9,7 @@ function signAccessToken(user) {
     id: user.id,
     email: user.email,
     username: user.username,
+    avatarUrl: user.avatarUrl,
   };
 
   // 강사일 경우에만 status 포함
