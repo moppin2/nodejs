@@ -79,17 +79,13 @@ const recordUpload = async (req, res) => {
   }
 };
 
-const getUploadList = async (req, res) => {
+const getVerifyFileList = async (req, res) => {
   try {
     const { target_type, target_id, purpose } = req.query;
 
     if (!target_type || !target_id || !purpose) {
       return res.status(400).json({ message: '필수 쿼리 누락' });
     }
-
-    // if (req.user.userType === 'user') {
-    //   return res.status(400).json({ message: '알반회원은 권한이 없습니다.' });
-    // }
 
     if (req.user.userType === 'instructor' && req.user.id != Number(target_id)) {
       return res.status(400).json({ message: '본인 자료만 조회 가능합니다.' });
@@ -107,7 +103,7 @@ const getUploadList = async (req, res) => {
   }
 };
 
-const generateDownloadUrl = async (req, res) => {
+const generateDownloadPresignedUrl = async (req, res) => {
   try {
     const { file_key } = req.query;
 
@@ -129,4 +125,42 @@ const generateDownloadUrl = async (req, res) => {
   }
 };
 
-module.exports = { generatePresignedUploadUrl, recordUpload, getUploadList, generateDownloadUrl };
+const getPublicFileUrl = async (req, res) => {
+  try {
+    const { target_type, target_id, purpose } = req.query;
+
+    if (!target_type || !target_id || !purpose) {
+      return res.status(400).json({ message: '필수 쿼리 누락' });
+    }
+
+    // 1) DB에서 공개된 파일만 조회
+    const files = await UploadFile.findAll({
+      where: {
+        target_type,
+        target_id,
+        purpose,
+        is_public: true
+      },
+      order: [['created_at', 'DESC']]
+    });
+
+    // 2) S3 버킷 네임 가져오기
+    const bucket = process.env.UPLOAD_BUCKET; 
+
+    // 3) file_key → 퍼블릭 URL 변환
+    const urls = files.map(f => ({
+      id: f.id,
+      file_key: f.file_key,
+      url: `https://${bucket}.s3.amazonaws.com/${f.file_key}`,
+      created_at: f.created_at
+    }));
+
+    // 4) URL 리스트 리턴
+    return res.status(200).json(urls);
+  } catch (err) {
+    console.error('파일 목록 조회 오류:', err);
+    return res.status(500).json({ message: '목록 조회 실패' });
+  }
+};
+
+module.exports = { generatePresignedUploadUrl, recordUpload, getVerifyFileList, generateDownloadPresignedUrl, getPublicFileUrl };

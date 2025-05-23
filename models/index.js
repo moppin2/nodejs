@@ -17,10 +17,12 @@ db.Instructor = require('./Instructor')(sequelize, DataTypes);
 db.Admin = require('./Admin')(sequelize, DataTypes);
 db.Course = require('./Course')(sequelize, DataTypes);
 db.CourseCompletionCriteria = require('./CourseCompletionCriteria')(sequelize, DataTypes);
+// 수업 관련 모델
 db.Class = require('./Class')(sequelize, DataTypes);
-// 수업 예약 모델
 db.ClassReservation = require('./ClassReservation')(sequelize, DataTypes);
 db.ClassReservationHistory = require('./ClassReservationHistory')(sequelize, DataTypes);
+db.ClassFeedback = require('./ClassFeedback')(sequelize, DataTypes);
+db.ClassReview = require('./ClassReview')(sequelize, DataTypes);
 
 db.RefreshToken = require('./RefreshToken')(sequelize, DataTypes);
 db.CodeGroup = require('./CodeGroup')(sequelize, DataTypes);
@@ -68,5 +70,15 @@ db.User.hasMany(db.ClassReservation, { foreignKey: 'user_id', as: 'classReservat
 // ClassReservation - History
 db.ClassReservation.hasMany(db.ClassReservationHistory, { foreignKey: 'reservation_id', as: 'histories' });
 db.ClassReservationHistory.belongsTo(db.ClassReservation, { foreignKey: 'reservation_id', as: 'reservation' });
+// ClassFeedback relationships
+db.ClassFeedback.belongsTo(db.Class, { foreignKey: 'class_id', as: 'class' });
+db.Class.hasMany(db.ClassFeedback, { foreignKey: 'class_id', as: 'feedbacks' });
+db.ClassFeedback.belongsTo(db.User, { foreignKey: 'user_id', as: 'user' });
+db.User.hasMany(db.ClassFeedback, { foreignKey: 'user_id', as: 'feedbacks' });
+// ClassReview relationships
+db.ClassReview.belongsTo(db.Class, { foreignKey: 'class_id', as: 'class' });
+db.Class.hasMany(db.ClassReview, { foreignKey: 'class_id', as: 'reviews' });
+db.ClassReview.belongsTo(db.User, { foreignKey: 'user_id', as: 'user' });
+db.User.hasMany(db.ClassReview, { foreignKey: 'user_id', as: 'reviews' });
 
 module.exports = db;

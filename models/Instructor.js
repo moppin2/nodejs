@@ -13,7 +13,7 @@ module.exports = (sequelize, DataTypes) => {
     },
     approved_at: { type: DataTypes.STRING(100) },
     career_years: { type: DataTypes.STRING(100) },
-    main_experience: { type: DataTypes.STRING(100) },
+    main_experience: { type: DataTypes.TEXT },
     comment: { type: DataTypes.TEXT },
     balance: { type: DataTypes.STRING(100) },
   }, {

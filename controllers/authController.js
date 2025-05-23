@@ -9,7 +9,7 @@ const { Op } = require('sequelize');
 
 exports.login = async (req, res) => {
   try {
-    const { userType, email, password } = req.body;
+    const { userType, email, password } = req.body; 
 
     let user = null;
 
@@ -388,11 +388,20 @@ exports.getInstructorById = async (req, res) => {
   }
 };
 
-exports.updateInstructorStatus = async (req, res) => {
-  // if (req.user.userType !== 'admin') {
-  //   return res.status(403).json({ message: '관리자만 승인/반려 가능합니다.' });
-  // }
+exports.getUserById = async (req, res) => {
+  try {
+    const user = await User.findByPk(req.params.id);
+    if (!user) {
+      return res.status(404).json({ message: '사용자를 찾을 수 없습니다.' });
+    }
+    res.json(user);
+  } catch (err) {
+    console.error('사용자 조회 오류:', err);
+    res.status(500).json({ message: '서버 오류' });
+  }
+};
 
+exports.updateInstructorStatus = async (req, res) => {
   try {
     const instructor = await Instructor.findByPk(req.params.id);
     if (!instructor) return res.status(404).json({ message: '강사를 찾을 수 없습니다.' });

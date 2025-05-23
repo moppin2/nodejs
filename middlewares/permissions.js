@@ -1,4 +1,5 @@
-const { Course } = require('../models');
+const { Course, ClassReservation, Class } = require('../models');
+const { Op } = require('sequelize');
 
 function permissionGuard({ allowedRoles = [], allowedStatus = [] }) {
   return (req, res, next) => {
@@ -81,4 +82,85 @@ const checkCoursePermission = async (req, res, next) => {
 };
 
 
-module.exports = { permissionGuard, checkUploadPermission, checkCoursePermission };
+// type: DataTypes.ENUM(
+//     'applied',       // 예약 신청
+//     'approved',      // 예약 승인
+//     'rejected',      // 예약 거부
+//     'cancel_request',// 취소 요청
+//     'cancelled'      // 예약 취소
+
+
+// type: DataTypes.ENUM(
+//     'apply',          // 예약 신청 => 학생
+//     'approve',        // 예약 승인 => 강사
+//     'reject',         // 예약 거부 => 강사
+//     'cancel',         // 예약 신청 => 학생/강사
+//     'cancel_request', // 취소 요청 => 학생
+//     'cancel_approve', // 취소 승인 => 강사
+//     'cancel_deny'     // 취소 거부 => 강사
+
+// 허용 가능한 상태 전환 맵
+const ALLOWED_TRANSITIONS = {
+  user: {
+    applied: ['cancel'],
+    approved: ['cancel_request']
+  },
+  instructor: {
+    applied: ['approve', 'reject'],
+    cancel_request: ['cancel_approve', 'cancel_deny'],
+    approved: ['cancel']
+  }
+};
+
+const validateReservationTransition = async (req, res, next) => {
+  const { id: reservationId } = req.params;
+  const { action } = req.body;
+  const { id: userId, userType } = req.user;
+
+
+
+  // 1) 타겟 예약 조회
+  const reservation = await ClassReservation.findByPk(reservationId);
+  if (!reservation) {
+    return res.status(404).json({ message: '예약을 찾을 수 없습니다.' });
+  }
+
+  if (new Date() >= reservation.class.start_datetime) {
+    return res.status(400).json({ message: '수업 시작 이후에는 상태를 변경할 수 없습니다.' });
+  }
+
+
+  // 2) 권한 검사
+  if (userType === 'user') {
+    if (reservation.user_id !== userId) {
+      return res.status(403).json({ message: '본인의 예약만 변경할 수 있습니다.' });
+    }
+  } else if (userType === 'instructor') {
+    // 강사라면 자신의 클래스 소유 여부 확인
+    const cls = await Class.findByPk(reservation.class_id, {
+      include: [{ model: Course, as: 'course', attributes: ['instructor_id'] }]
+    });
+    if (!cls || cls.course.instructor_id !== userId) {
+      return res.status(403).json({ message: '본인 수업의 예약만 변경할 수 있습니다.' });
+    }
+  } else {
+    return res.status(403).json({ message: '권한이 없습니다.' });
+  }
+
+  // 3) 전환 허용 여부 검사
+  const from = reservation.status;
+  const allowed = (ALLOWED_TRANSITIONS[userType] || {})[from] || [];
+  if (!allowed.includes(action)) {
+    return res.status(400).json({
+      message: `상태 전환 불가: ${from} → ${action}`
+    });
+  }
+
+  //수업 시작시간이 지나거나 마감 완료 되었을때 처리
+
+  // 4) 검증 통과: 다음 미들웨어/컨트롤러에서 사용하도록 붙여두기
+  req.reservation = reservation;
+  next();
+}
+
+module.exports = { permissionGuard, checkUploadPermission, checkCoursePermission, validateReservationTransition };

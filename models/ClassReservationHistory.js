@@ -20,6 +20,7 @@ module.exports = (sequelize, DataTypes) => {
                 'apply',          // 예약 신청
                 'approve',        // 예약 승인
                 'reject',         // 예약 거부
+                'cancel',         // 예약 취소
                 'cancel_request', // 취소 요청
                 'cancel_approve', // 취소 승인
                 'cancel_deny'     // 취소 거부
