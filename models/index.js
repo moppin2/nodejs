@@ -20,7 +20,7 @@ db.CourseCompletionCriteria = require('./CourseCompletionCriteria')(sequelize, D
 // 수업 관련 모델
 db.Class = require('./Class')(sequelize, DataTypes);
 db.ClassReservation = require('./ClassReservation')(sequelize, DataTypes);
-db.ClassReservationHistory = require('./ClassReservationHistory')(sequelize, DataTypes);
+db.ClassReservationHistory = require('./ClassReservationHistory')(sequelize, DataTypes); 
 db.ClassFeedback = require('./ClassFeedback')(sequelize, DataTypes);
 db.ClassReview = require('./ClassReview')(sequelize, DataTypes);
 
@@ -32,6 +32,7 @@ db.License = require('./License')(sequelize, DataTypes);
 db.InstructorVerificationHistory = require('./InstructorVerificationHistory')(sequelize, DataTypes);
 db.CourseApplication = require('./CourseApplication')(sequelize, DataTypes);
 db.CourseApplicationHistory = require('./CourseApplicationHistory')(sequelize, DataTypes);
+db.StudentCourseProgress = require('./StudentCourseProgress')(sequelize, DataTypes);
 
 // 관계 정의
 // Instructor - Course
@@ -80,5 +81,35 @@ db.ClassReview.belongsTo(db.Class, { foreignKey: 'class_id', as: 'class' });
 db.Class.hasMany(db.ClassReview, { foreignKey: 'class_id', as: 'reviews' });
 db.ClassReview.belongsTo(db.User, { foreignKey: 'user_id', as: 'user' });
 db.User.hasMany(db.ClassReview, { foreignKey: 'user_id', as: 'reviews' });
+
+// User 모델과 StudentCourseProgress 관계
+db.User.hasMany(db.StudentCourseProgress, {
+    foreignKey: 'user_id',
+    as: 'courseProgress' // 사용자가 통과한 수료 기준 목록
+});
+db.StudentCourseProgress.belongsTo(db.User, {
+    foreignKey: 'user_id',
+    as: 'user'
+});
+
+// CourseCompletionCriteria 모델과 StudentCourseProgress 관계
+db.CourseCompletionCriteria.hasMany(db.StudentCourseProgress, {
+    foreignKey: 'criterion_id',
+    as: 'progressRecords' // 이 수료 기준을 통과한 학생들의 기록
+});
+db.StudentCourseProgress.belongsTo(db.CourseCompletionCriteria, {
+    foreignKey: 'criterion_id',
+    as: 'criterion'
+});
+
+// Class 모델과 StudentCourseProgress 관계
+db.Class.hasMany(db.StudentCourseProgress, {
+    foreignKey: 'class_id',
+    as: 'passedCriteriaRecords' // 이 수업에서 통과 처리된 기준 기록들
+});
+db.StudentCourseProgress.belongsTo(db.Class, {
+    foreignKey: 'class_id',
+    as: 'classWherePassed' // 어느 수업에서 통과했는지
+});
 
 module.exports = db;

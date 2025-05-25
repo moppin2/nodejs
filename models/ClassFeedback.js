@@ -41,6 +41,12 @@ module.exports = (sequelize, DataTypes) => {
       defaultValue: false,
       comment: '최종 피드백 공개 여부',
     },
+    is_publication_requested: {
+      type: DataTypes.BOOLEAN,
+      allowNull: true,
+      defaultValue: null,
+      comment: '강사의 공개 요청 상태 (null: 임시저장, true: 요청함, false: 요청안함으로 확정)',
+    },
     publish_requested_at: {
       type: DataTypes.DATE,
       allowNull: true,

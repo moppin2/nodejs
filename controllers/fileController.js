@@ -1,5 +1,6 @@
 const { S3Client, PutObjectCommand, GetObjectCommand } = require('@aws-sdk/client-s3');
 const { getSignedUrl } = require('@aws-sdk/s3-request-presigner');
+const AWS = require('aws-sdk');
 const { v4: uuidv4 } = require('uuid');
 const { UploadFile } = require('../models');
 require('dotenv').config();
@@ -21,7 +22,7 @@ const generatePresignedUploadUrl = async (req, res) => {
     }
 
     // 간단한 입력값 필터링 (보안 강화)
-    const sanitize = str => str.replace(/[^a-zA-Z0-9_-]/g, '');
+    const sanitize = str => str.replace(/[^a-zA-Z0-9_-]/g, ''); 
     target_type = sanitize(target_type);
     purpose = sanitize(purpose);
 
@@ -72,7 +73,32 @@ const recordUpload = async (req, res) => {
       is_public
     });
 
-    res.status(201).json({ message: '파일 정보 저장 완료', id: record.id });
+    const s3 = new AWS.S3(); // AWS SDK S3 인스턴스
+    let display_url;
+
+    if (is_public) { // is_public은 req.body 또는 저장된 UploadFile 레코드에서 가져옴
+      const bucketName = process.env.UPLOAD_BUCKET;; // .env 등에서 버킷 이름 가져오기
+      display_url = `https://${bucketName}.s3.amazonaws.com/${file_key}`;
+    } else {
+      const params = {
+        Bucket: process.env.UPLOAD_BUCKET,
+        Key: file_key,
+        Expires: 60 * 15 // 예: 15분 동안 유효한 URL
+      };
+      try {
+        display_url = await s3.getSignedUrlPromise('getObject', params);
+      } catch (s3Error) {
+        console.error("Error generating presigned URL for private file:", s3Error);
+        // 적절한 에러 처리
+      }
+    }
+    // 응답에 display_url 포함
+    res.status(200).json({
+      message: '파일 기록 성공',
+      file_key,
+      url: display_url, // 또는 display_url 이라는 명확한 필드명 사용
+    });
+
   } catch (err) {
     console.error('업로드 기록 저장 오류:', err);
     res.status(500).json({ message: 'DB 저장 실패' });
@@ -145,7 +171,7 @@ const getPublicFileUrl = async (req, res) => {
     });
 
     // 2) S3 버킷 네임 가져오기
-    const bucket = process.env.UPLOAD_BUCKET; 
+    const bucket = process.env.UPLOAD_BUCKET;
 
     // 3) file_key → 퍼블릭 URL 변환
     const urls = files.map(f => ({

@@ -76,7 +76,8 @@ exports.upsertCourse = async (req, res) => {
         const values = criteriaList.map(c => ({
           course_id: course.id,
           type: c.type,
-          value: c.value
+          value: c.value,
+          sort_order: c.sort_order
         }));
         await CourseCompletionCriteria.bulkCreate(values);
       }
@@ -400,7 +401,8 @@ exports.getCourseDetail = async (req, res) => {
 
     const criteriaList = await CourseCompletionCriteria.findAll({
       where: { course_id: id },
-      attributes: ['type', 'value']
+      attributes: ['type', 'value', 'sort_order'],
+      order: [['sort_order', 'ASC']]
     });
 
     const files = await UploadFile.findAll({
@@ -455,6 +457,7 @@ const updateCompletionCriteria = async (courseId, criteriaList) => {
   const existingIds = existing.map(c => c.id);
   const newIds = criteriaList.filter(c => c.id).map(c => c.id);
 
+
   // 2. 삭제 대상 = 기존에 있었는데 요청에는 없는 것
   const toDelete = existingIds.filter(id => !newIds.includes(id));
 
@@ -468,7 +471,11 @@ const updateCompletionCriteria = async (courseId, criteriaList) => {
   const toUpdate = criteriaList.filter(c => c.id && existingIds.includes(c.id));
   for (const item of toUpdate) {
     await CourseCompletionCriteria.update(
-      { type: item.type, value: item.value },
+      {
+        type: item.type,
+        value: item.value,
+        sort_order: item.sort_order
+      },
       { where: { id: item.id } }
     );
   }
@@ -480,7 +487,8 @@ const updateCompletionCriteria = async (courseId, criteriaList) => {
       toCreate.map(c => ({
         course_id: courseId,
         type: c.type,
-        value: c.value
+        value: c.value,
+        sort_order: c.sort_order
       }))
     );
   }
