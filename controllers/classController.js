@@ -454,54 +454,73 @@ exports.createFeedback = async (req, res) => {
         feedback_text,
         rating,
         file_keys = [], // MultiImageUploader에서 전달된 file_key 배열
+        passed_criterion_ids = [] // 프론트에서 전달된, 이번에 통과한 기준 ID 목록
     } = req.body;
 
     const instructorId = req.user.id; // 현재 로그인한 강사 ID (authMiddleware를 통해 설정됨)
     const now = new Date();
 
+    // Sequelize 트랜잭션 시작
+    const t = await ClassFeedback.sequelize.transaction();
+
     try {
         // 1. 필수 값 검증
         if (!class_id || !user_id || !feedback_text) {
+            await t.rollback();
             return res.status(400).json({ message: '수업 ID, 학생 ID, 피드백 내용은 필수입니다.' });
         }
-        if (!rating) { // 평점도 필수라고 가정
+        if (rating === undefined || rating === null) {
+            await t.rollback();
             return res.status(400).json({ message: '평점은 필수입니다.' });
         }
-
 
         // 2. 권한 검증: 요청한 강사가 해당 수업의 실제 강사인지 확인
         const targetClass = await Class.findByPk(class_id, {
             include: [{
                 model: Course,
-                as: 'course', // Class 모델과 Course 모델 간의 관계 설정 alias
-                attributes: ['instructor_id']
-            }]
+                as: 'course',
+                attributes: ['instructor_id', 'id'] // course_id도 StudentCourseProgress에 필요
+            }],
+            transaction: t // 트랜잭션에 포함
         });
 
         if (!targetClass) {
+            await t.rollback();
             return res.status(404).json({ message: '수업을 찾을 수 없습니다.' });
         }
 
-        if (targetClass.course.instructor_id !== instructorId) {
+        if (!targetClass.course || targetClass.course.instructor_id !== instructorId) {
+            await t.rollback();
             return res.status(403).json({ message: '해당 수업의 강사만 피드백을 작성할 수 있습니다.' });
         }
 
-        if (targetClass.end_datetime > now) {
+        // 수업 종료 여부 확인
+        if (targetClass.end_datetime && new Date(targetClass.end_datetime) > now) {
+            await t.rollback();
             return res.status(403).json({ message: '수업 종료 후 피드백 작성 가능합니다.' });
         }
 
-        // 3. 해당 학생(user_id)이 실제로 해당 수업(class_id)에 등록/참여했는지 검증 로직
-        const reservation = await ClassReservation.findOne({ where: { class_id, user_id, status: { [Op.in]: ['approved', 'applied', 'cancel_request'] } } });
+        // 3. 해당 학생 참여 검증
+        const reservation = await ClassReservation.findOne({
+            where: {
+                class_id: Number(class_id),
+                user_id: Number(user_id),
+                status: 'approved'
+            },
+            transaction: t
+        });
         if (!reservation) {
-            return res.status(403).json({ message: '예약하지 않았거나 예약확정이 되지 않은 수강생 입니다.' });
+            await t.rollback();
+            return res.status(403).json({ message: '해당 수업에 참여한 학생이 아니거나 예약 상태가 올바르지 않습니다.' });
         }
 
-        // 4. 중복 피드백 방지 (DB unique 제약조건이 있지만, API 레벨에서도 한번 더 확인 가능)
-        // ClassFeedback 모델에 (class_id, user_id) unique 제약조건이 설정되어 있다고 가정
+        // 4. 중복 피드백 방지
         const existingFeedback = await ClassFeedback.findOne({
-            where: { class_id: Number(class_id), user_id: Number(user_id) }
+            where: { class_id: Number(class_id), user_id: Number(user_id) },
+            transaction: t
         });
         if (existingFeedback) {
+            await t.rollback();
             return res.status(409).json({ message: '이미 해당 학생에 대한 이 수업의 피드백이 존재합니다. 수정을 이용해주세요.' });
         }
 
@@ -517,35 +536,59 @@ exports.createFeedback = async (req, res) => {
             publish_rejected: false,
             reject_reason: null,
             is_public: false
-        });
+        }, { transaction: t });
 
-        // 6. 업로드된 파일 정보(UploadFile)의 target_id를 새로 생성된 feedback.id로 업데이트
+        // 6. 파일 연결 업데이트
         if (file_keys && file_keys.length > 0) {
             await UploadFile.update(
                 {
                     target_id: newFeedback.id,
-                    target_type: 'feedback' // target_type을 명시적으로 'feedback'으로 설정
+                    target_type: 'feedback'
                 },
                 {
-                    where: {
-                        file_key: { [Op.in]: file_keys },
-                        // 추가 조건: 아직 target_id가 할당되지 않은 파일들만 대상으로 하거나,
-                        // 또는 이전에 임시 target_type/target_id로 저장된 파일들을 대상으로 할 수 있음
-                        // target_id: null // 만약 /api/upload/record에서 target_id 없이 저장했다면
-                    }
+                    where: { file_key: { [Op.in]: file_keys } },
+                    transaction: t
                 }
             );
         }
 
+        // --- 7. 수료 기준 통과 정보 저장 로직 추가 ---
+        if (targetClass.course?.id && passed_criterion_ids && passed_criterion_ids.length > 0) {
+            for (const criterionId of passed_criterion_ids) {
+                // findOrCreate: 해당 학생이 이 기준을 이미 통과했으면 찾고, 아니면 새로 생성
+                // StudentCourseProgress 모델에 (user_id, criterion_id) UNIQUE 제약조건이 있어야 함
+                const [progress, created] = await StudentCourseProgress.findOrCreate({
+                    where: {
+                        user_id: Number(user_id),
+                        criterion_id: Number(criterionId)
+                    },
+                    defaults: { // 새로 생성될 때의 기본값
+                        user_id: Number(user_id),
+                        criterion_id: Number(criterionId),
+                        class_id: Number(class_id), // 이 수업에서 통과 처리됨
+                        // course_id: targetClass.course.id, // StudentCourseProgress 모델에 course_id가 있다면
+                        // passed_at: new Date(), // 모델에서 제거했으므로 created_at 자동 생성 활용
+                        notes: `Feedback ID ${newFeedback.id}에서 통과 처리됨`,
+                    },
+                    transaction: t
+                });
+                // if (created) { console.log(`Student ${user_id} passed criterion ${criterionId} in class ${class_id}`); }
+                // else { console.log(`Student ${user_id} already passed criterion ${criterionId}`); }
+            }
+        }
+        // --- 수료 기준 통과 정보 저장 로직 끝 ---
+
+        await t.commit(); // 모든 작업 성공 시 트랜잭션 커밋
+
         res.status(201).json({
             message: '피드백이 성공적으로 생성되었습니다.',
-            feedbackId: newFeedback.id, // 생성된 피드백 ID 반환
-            feedback: newFeedback     // 생성된 피드백 객체 전체 반환 (선택)
+            feedbackId: newFeedback.id,
+            feedback: newFeedback
         });
 
     } catch (err) {
+        await t.rollback(); // 오류 발생 시 트랜잭션 롤백
         console.error('피드백 생성 오류:', err);
-        // Sequelize의 UniqueConstraintError 처리 (class_id, user_id 중복 시)
         if (err.name === 'SequelizeUniqueConstraintError') {
             return res.status(409).json({ message: '이미 해당 학생에 대한 이 수업의 피드백이 존재합니다. 수정을 이용해주세요.' });
         }
@@ -554,91 +597,125 @@ exports.createFeedback = async (req, res) => {
 };
 
 exports.updateFeedback = async (req, res) => {
-    const { feedbackId } = req.params; // 라우트 파라미터에서 feedbackId 가져오기
+    const { feedbackId } = req.params;
     const {
         feedback_text,
         rating,
-        file_keys = [],         // 최종적으로 이 피드백에 연결될 파일들의 key 목록
+        file_keys = [],
+        passed_criterion_ids = []
     } = req.body;
     const instructorId = req.user.id;
 
+    const t = await ClassFeedback.sequelize.transaction();
+
     try {
-        // 1. 피드백 존재 여부 확인
+        // 1. 피드백 존재 여부 및 강사 권한 확인
         const feedback = await ClassFeedback.findByPk(feedbackId, {
-            include: [{ // 피드백이 속한 수업 및 과정 정보를 가져와 강사 확인
+            include: [{
                 model: Class,
-                as: 'class', // ClassFeedback 모델과 Class 모델 간의 관계 alias
+                as: 'class',
                 include: [{
                     model: Course,
-                    as: 'course', // Class 모델과 Course 모델 간의 관계 alias
-                    attributes: ['instructor_id']
+                    as: 'course',
+                    attributes: ['id', 'instructor_id']
                 }]
-            }]
+            }],
+            transaction: t
         });
 
         if (!feedback) {
+            await t.rollback();
             return res.status(404).json({ message: '피드백을 찾을 수 없습니다.' });
         }
 
-        // 2. 권한 검증: 요청한 강사가 해당 피드백이 속한 수업의 실제 강사인지 확인
         if (!feedback.class || !feedback.class.course || feedback.class.course.instructor_id !== instructorId) {
+            await t.rollback();
             return res.status(403).json({ message: '해당 피드백을 수정할 권한이 없습니다.' });
         }
 
-        // 3. 피드백 수정 가능 상태 검증 (중요!)
-        // 예: is_publication_requested가 null (임시저장)인 경우에만 수정 가능
-        const isEditable = feedback.is_publication_requested === null;
-        if (!isEditable) {
-            return res.status(403).json({ message: '현재 상태에서는 피드백을 수정할 수 없습니다.' });
+        // 2. 피드백 수정 가능 상태 검증
+        if (feedback.is_publication_requested !== null) {
+            await t.rollback();
+            return res.status(403).json({ message: '임시 저장 상태의 피드백만 내용을 수정할 수 있습니다.' });
         }
 
-        // 4. 피드백 내용 업데이트
-        feedback.feedback_text = feedback_text;
-        feedback.rating = Number(rating);
-        feedback.is_publication_requested = null;
-        feedback.publish_requested_at = null;
-        feedback.publish_approved = false;
-        feedback.publish_rejected = false;
-        feedback.reject_reason = null;
-        feedback.is_public = false;
+        // 3. 피드백 내용 업데이트
+        const updateData = {};
+        if (feedback_text !== undefined) updateData.feedback_text = feedback_text;
+        if (rating !== undefined) updateData.rating = Number(rating);
 
-        await feedback.save();
+        updateData.is_publication_requested = null;
+        updateData.publish_requested_at = null;
+        updateData.publish_approved = false;
+        updateData.publish_rejected = false;
+        updateData.reject_reason = null;
+        updateData.is_public = false;
 
-        // 5. 파일 연결 업데이트 (Course 수정 로직 참고)
-        // 5a. 기존에 이 피드백(target_id)에 연결되어 있던 'feedback' 타입의 파일들의 연결을 모두 해제 (target_id: null)
+        await feedback.update(updateData, { transaction: t });
+
+        // 4. 파일 연결 업데이트
         await UploadFile.update(
             { target_id: null },
             {
                 where: {
                     target_type: 'feedback',
-                    target_id: feedback.id
-                }
+                    target_id: feedback.id,
+                },
+                transaction: t
             }
         );
-
-        // 5b. 요청 바디에 포함된 새로운 file_keys들을 현재 feedback.id에 연결
         if (file_keys && file_keys.length > 0) {
             await UploadFile.update(
+                { target_id: feedback.id, target_type: 'feedback' },
                 {
-                    target_id: feedback.id,
-                    target_type: 'feedback' // 명시적으로 다시 설정
-                },
-                {
-                    where: {
-                        file_key: { [Op.in]: file_keys }
-                        // 이 file_key들은 이미 UploadFile 테이블에 존재해야 하며,
-                        // 이전 단계(Presigned URL 발급 및 /api/upload/record)에서 target_id가 없거나 임시값으로 저장되었을 수 있음
-                    }
+                    where: { file_key: { [Op.in]: file_keys } },
+                    transaction: t
                 }
             );
         }
 
+
+        const studentId = feedback.user_id;
+        const classId = feedback.class_id;
+        const courseId = feedback.class.course.id;
+
+        // 5a. 이 수업(classId)에서 이 학생(studentId)이 통과한 것으로 기록된 모든 StudentCourseProgress 레코드를 삭제합니다.
+        await StudentCourseProgress.destroy({
+            where: {
+                user_id: studentId,
+                class_id: classId
+            },
+            transaction: t
+        });
+
+        // 5b. 프론트엔드에서 새로 전달된 passed_criterion_ids에 대해서만 StudentCourseProgress 레코드를 생성 (findOrCreate)
+        if (courseId && passed_criterion_ids && passed_criterion_ids.length > 0) {
+            for (const criterionId of passed_criterion_ids) {
+                await StudentCourseProgress.findOrCreate({
+                    where: {
+                        user_id: studentId,
+                        criterion_id: Number(criterionId)
+                    },
+                    defaults: {
+                        user_id: studentId,
+                        criterion_id: Number(criterionId),
+                        class_id: classId,
+                        notes: `Feedback ID ${feedback.id}에서 통과 처리됨 (수정 시점)`,
+                    },
+                    transaction: t
+                });
+            }
+        }
+
+        await t.commit();
+
         res.status(200).json({
             message: '피드백이 성공적으로 수정되었습니다.',
-            feedback: feedback
+            feedback: await feedback.reload()
         });
 
     } catch (err) {
+        await t.rollback();
         console.error('피드백 수정 오류:', err);
         res.status(500).json({ message: '서버 오류로 인해 피드백 수정에 실패했습니다.' });
     }
@@ -837,7 +914,7 @@ exports.finalizeFeedbackAsNonPublic = async (req, res) => {
         feedback.publish_approved = false;
         feedback.publish_rejected = false;
         feedback.reject_reason = null;
-        feedback.is_public = false; // 미공개 확정이므로 당연히 비공개
+        feedback.is_public = false;
 
         await feedback.save();
 
@@ -858,108 +935,167 @@ exports.getCourseProgressWithStatus = async (req, res) => {
     }
 
     try {
-        let courseCriteriaList = [];
-        let progressRecords = [];
 
-        if (courseId) {
-            // 1. 해당 courseId의 모든 수료 기준(CourseCompletionCriteria)을 가져옵니다.
-            courseCriteriaList = await CourseCompletionCriteria.findAll({
+        if (courseId && studentId) {
+            // 시나리오 1: courseId와 studentId 모두 제공 (특정 학생의 특정 과정 진행 현황)
+
+            // 1. 해당 과정의 모든 수료 기준 가져오기
+            criteriaResponse = await CourseCompletionCriteria.findAll({
                 where: { course_id: courseId },
                 attributes: ['id', 'course_id', 'type', 'value', 'description', 'sort_order'],
                 order: [['sort_order', 'ASC'], ['id', 'ASC']],
-                // raw: true, // .get({ plain: true })를 사용할 것이므로 raw: true는 선택적
+                raw: true,
             });
 
-            if (!courseCriteriaList.length) {
-                // 과정에 기준이 없으면 빈 결과 반환
-                return res.json({ criteria: [], studentProgress: [] });
+            // 2. 해당 학생의 해당 과정 기준들에 대한 통과 기록 가져오기
+            if (criteriaResponse.length > 0) {
+                const criteriaIds = criteriaResponse.map(c => c.id);
+                const progressRecords = await StudentCourseProgress.findAll({
+                    where: {
+                        user_id: studentId,
+                        criterion_id: { [Op.in]: criteriaIds }
+                    },
+                    attributes: ['user_id', 'criterion_id', 'class_id', 'notes', 'created_at'],
+                    include: [
+                        { model: User, as: 'user', attributes: ['id', 'name'] },
+                        { model: Class, as: 'classWherePassed', attributes: ['id', 'title'] }
+                    ],
+                    raw: true, // include된 객체도 plain object로 받기 위해선 별도 처리 필요 또는 map에서 .get()
+                });
+                // raw:true 사용 시 include된 객체는 prog['user.name'] 등으로 접근해야 함.
+                // 여기서는 map에서 prog.user?.name을 사용하므로 findAll에서 raw:true를 빼고 아래에서 .get() 사용
             }
-
-            const criteriaIds = courseCriteriaList.map(c => c.id);
-
-            // 2. StudentCourseProgress 조회 조건 설정
-            const progressWhereClause = {
-                criterion_id: { [Op.in]: criteriaIds },
-            };
-            if (studentId) {
-                progressWhereClause.user_id = studentId;
-            }
-
-            progressRecords = await StudentCourseProgress.findAll({
-                where: progressWhereClause,
+            // progressRecords를 가져오는 부분을 criteriaResponse.length > 0 안으로 옮김
+            const criteriaIds = criteriaResponse.map(c => c.id);
+            const progressRecordsRaw = await StudentCourseProgress.findAll({
+                where: {
+                    user_id: studentId,
+                    criterion_id: { [Op.in]: criteriaIds }
+                },
                 attributes: ['user_id', 'criterion_id', 'class_id', 'notes', 'created_at'],
                 include: [
                     { model: User, as: 'user', attributes: ['id', 'name'] },
                     { model: Class, as: 'classWherePassed', attributes: ['id', 'title'] }
                 ],
-                order: studentId ? [['criterion_id', 'ASC']] : [['user_id', 'ASC'], ['criterion_id', 'ASC']],
             });
 
-            // Sequelize 인스턴스를 plain object로 변환
-            courseCriteriaList = courseCriteriaList.map(c => c.get({ plain: true }));
-            progressRecords = progressRecords.map(p => p.get({ plain: true }));
+            studentProgressResponse = progressRecordsRaw.map(pInstance => {
+                const prog = pInstance.get({ plain: true });
+                const criterionDetail = criteriaResponse.find(c => c.id === prog.criterion_id);
+                return {
+                    studentId: prog.user_id,
+                    studentName: prog.user?.name || null,
+                    criterionId: prog.criterion_id,
+                    courseId: criterionDetail?.course_id || courseId,
+                    criterionType: criterionDetail?.type || null,
+                    criterionValue: criterionDetail?.value || null,
+                    classId: prog.class_id,
+                    className: prog.classWherePassed?.title || null,
+                    passed_at: prog.created_at,
+                    notes: prog.notes || null
+                };
+            });
 
+
+        } else if (courseId) {
+            // 시나리오 2: courseId만 제공 (해당 과정의 모든 학생 진행 현황)
+
+            // 1. 해당 과정의 모든 수료 기준 가져오기
+            criteriaResponse = await CourseCompletionCriteria.findAll({
+                where: { course_id: courseId },
+                attributes: ['id', 'course_id', 'type', 'value', 'description', 'sort_order'],
+                order: [['sort_order', 'ASC'], ['id', 'ASC']],
+                raw: true,
+            });
+
+            // 2. 해당 과정 기준들에 대한 모든 학생의 통과 기록 가져오기
+            if (criteriaResponse.length > 0) {
+                const criteriaIds = criteriaResponse.map(c => c.id);
+                const progressRecordsRaw = await StudentCourseProgress.findAll({
+                    where: {
+                        criterion_id: { [Op.in]: criteriaIds }
+                    },
+                    attributes: ['user_id', 'criterion_id', 'class_id', 'notes', 'created_at'],
+                    include: [
+                        { model: User, as: 'user', attributes: ['id', 'name'] },
+                        { model: Class, as: 'classWherePassed', attributes: ['id', 'title'] }
+                    ],
+                    order: [['user_id', 'ASC'], ['criterion_id', 'ASC']],
+                });
+
+                studentProgressResponse = progressRecordsRaw.map(pInstance => {
+                    const prog = pInstance.get({ plain: true });
+                    const criterionDetail = criteriaResponse.find(c => c.id === prog.criterion_id);
+                    return {
+                        studentId: prog.user_id,
+                        studentName: prog.user?.name || null,
+                        criterionId: prog.criterion_id,
+                        courseId: criterionDetail?.course_id || courseId,
+                        criterionType: criterionDetail?.type || null,
+                        criterionValue: criterionDetail?.value || null,
+                        classId: prog.class_id,
+                        className: prog.classWherePassed?.title || null,
+                        passed_at: prog.created_at,
+                        notes: prog.notes || null
+                    };
+                });
+            }
 
         } else if (studentId) {
-            // 3. studentId만 제공된 경우: 해당 학생의 모든 StudentCourseProgress 기록을 가져옵니다.
-            progressRecords = await StudentCourseProgress.findAll({
+            // 시나리오 3: studentId만 제공 (해당 학생의 모든 과정에 대한 모든 통과 현황)
+
+            // 1. 해당 학생의 모든 통과 기록(StudentCourseProgress) 가져오기
+            const progressRecordsRaw = await StudentCourseProgress.findAll({
                 where: { user_id: studentId },
                 attributes: ['user_id', 'criterion_id', 'class_id', 'notes', 'created_at'],
                 include: [
                     { model: User, as: 'user', attributes: ['id', 'name'] },
                     { model: Class, as: 'classWherePassed', attributes: ['id', 'title'] }
                 ],
-                order: [['criterion_id', 'ASC']], // 또는 course_id, criterion_id 순 정렬 위해 Course 정보 join 필요
+                // 과정별, 기준별 정렬을 위해 CourseCompletionCriteria를 통해 Course 정보도 가져오면 좋음
+                // 여기서는 일단 criterion_id로 정렬
+                order: [
+                    // [sequelize.literal('`criterion.course.id`'), 'ASC'], // 예시: 만약 criterion을 include 했다면
+                    ['criterion_id', 'ASC'] // 또는 created_at 등
+                ],
             });
 
-            progressRecords = progressRecords.map(p => p.get({ plain: true }));
+            // 2. 통과한 모든 criterion_id에 해당하는 CourseCompletionCriteria 정보 가져오기
+            if (progressRecordsRaw.length > 0) {
+                const distinctCriterionIds = [...new Set(progressRecordsRaw.map(p => p.get('criterion_id')))];
 
-            // 이 경우, 각 progressRecord에 해당하는 CourseCompletionCriteria 정보와 courseId를 추가로 가져와야 합니다.
-            if (progressRecords.length > 0) {
-                const distinctCriterionIds = [...new Set(progressRecords.map(p => p.criterion_id))];
-                const criteriaDetails = await CourseCompletionCriteria.findAll({
+                const criteriaDetailsForStudent = await CourseCompletionCriteria.findAll({
                     where: { id: { [Op.in]: distinctCriterionIds } },
                     attributes: ['id', 'course_id', 'type', 'value', 'description', 'sort_order'],
+                    order: [['course_id', 'ASC'], ['sort_order', 'ASC'], ['id', 'ASC']],
                     raw: true,
                 });
-                const criteriaDetailMap = new Map(criteriaDetails.map(c => [c.id, c]));
+                criteriaResponse = criteriaDetailsForStudent; // 학생이 통과한 기준들의 정의 목록
 
-                // courseCriteriaList를 채워서 아래 최종 결과 가공 시 사용 (또는 progressRecords에 직접 병합)
-                courseCriteriaList = criteriaDetails; // 이 API 응답의 'criteria' 부분에 사용될 수 있음 (중복될 수 있음)
+                const criteriaDetailMap = new Map(criteriaDetailsForStudent.map(c => [c.id, c]));
 
-                // progressRecords에 criterion 상세 정보와 courseId를 병합 (결과 형식을 통일하기 위함)
-                progressRecords.forEach(prog => {
-                    const critDetail = criteriaDetailMap.get(prog.criterion_id);
-                    prog.criterion_type = critDetail?.type;
-                    prog.criterion_value = critDetail?.value;
-                    prog.course_id_from_criterion = critDetail?.course_id; // courseId 정보 추가
+                studentProgressResponse = progressRecordsRaw.map(pInstance => {
+                    const prog = pInstance.get({ plain: true });
+                    const criterionDetail = criteriaDetailMap.get(prog.criterion_id);
+                    return {
+                        studentId: prog.user_id,
+                        studentName: prog.user?.name || null,
+                        criterionId: prog.criterion_id,
+                        courseId: criterionDetail?.course_id || null, // 기준으로부터 courseId 추출
+                        criterionType: criterionDetail?.type || null,
+                        criterionValue: criterionDetail?.value || null,
+                        classId: prog.class_id,
+                        className: prog.classWherePassed?.title || null,
+                        passed_at: prog.created_at,
+                        notes: prog.notes || null
+                    };
                 });
             }
         }
 
-        // 최종 결과 가공 (courseId가 제공되었을 때의 studentProgress 형식과 유사하게 맞춤)
-        const finalStudentProgress = progressRecords.map(prog => ({
-            studentId: prog.user_id,
-            studentName: prog.user?.name || null,
-            criterionId: prog.criterion_id,
-            // courseId가 제공되었을 때는 criteriaList에서 가져오고, studentId만 있을때는 prog에 병합된 정보 사용
-            // 이 부분은 프론트에서 criteria 리스트와 매칭하거나, 아래처럼 API에서 제공할 수 있음
-            // type: (criteriaMap.get(prog.criterion_id))?.type, (courseId 있을때)
-            // value: (criteriaMap.get(prog.criterion_id))?.value, (courseId 있을때)
-            classId: prog.class_id,
-            className: prog.classWherePassed?.title || null,
-            passed_at: prog.created_at,
-            notes: prog.notes || null,
-            // studentId만 제공된 경우를 위해, 각 progress 항목에 courseId와 criterion 상세 정보를 포함시키는 것이 좋음
-            courseId: prog.course_id_from_criterion || (courseId ? parseInt(courseId) : null),
-            criterionType: prog.criterion_type || (criteriaMap.get(prog.criterion_id))?.type,
-            criterionValue: prog.criterion_value || (criteriaMap.get(prog.criterion_id))?.value
-        }));
-
-
         res.status(200).json({
-            criteria: courseId ? courseCriteriaList : (studentId && courseCriteriaList.length > 0 ? courseCriteriaList : []), // courseId가 있을 때만 의미있는 criteria 목록, 또는 studentId 조회시 관련된 criteria
-            studentProgress: finalStudentProgress
+            criteria: criteriaResponse,
+            studentProgress: studentProgressResponse
         });
 
     } catch (err) {
