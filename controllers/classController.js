@@ -162,7 +162,7 @@ exports.getMyClassList = async (req, res) => {
                 include: [{ model: User, as: 'user', attributes: ['id', 'name'] }]
             });
             // --- 추가 시작: 이 예약들에 해당하는 모든 학생 피드백 한 번에 조회 ---
-            const studentFeedbackMap = {};
+            const studentFeedbackMap = {}, studentReviewMap = {};;
             if (allRes.length > 0) {
                 const feedbackQueryConditions = allRes.map(res => ({
                     class_id: res.class_id,
@@ -187,6 +187,17 @@ exports.getMyClassList = async (req, res) => {
                 allStudentFeedbacks.forEach(fb => {
                     // 각 class_id 와 user_id 조합을 키로 사용하여 피드백 객체 저장
                     studentFeedbackMap[`c${fb.class_id}_u${fb.user_id}`] = fb.get({ plain: true });
+                });
+
+                const reviewAttributes = [
+                    'id', 'class_id', 'user_id', 'is_public'
+                ];
+                (await ClassReview.findAll({
+                    where: { class_id: { [Op.in]: classIds } }, //////////////////////////////where 맞는지 확인 필요
+                    attributes: reviewAttributes
+                })).forEach(rvInstance => { // rvInstance로 변경
+                    // 각 class_id 와 user_id 조합을 키로 사용하여 피드백 객체 저장
+                    studentReviewMap[`c${rvInstance.class_id}_u${rvInstance.user_id}`] = rvInstance.get({ plain: true });
                 });
             }
             // --- 추가 끝 ---
@@ -213,6 +224,7 @@ exports.getMyClassList = async (req, res) => {
                     if (r.status === 'cancel_request') effectiveStatus = 'approved';
                 }
                 const currentStudentFeedback = studentFeedbackMap[`c${r.class_id}_u${r.user_id}`] || null;
+                const currentStudentReview = studentReviewMap[`c${r.class_id}_u${r.user_id}`] || null;
                 reservationListMap[r.class_id].push({
                     id: r.id,
                     status: effectiveStatus,
@@ -222,7 +234,8 @@ exports.getMyClassList = async (req, res) => {
                         userType: 'user',
                         avatarUrl: studentAvatarMap[r.user.id] || null
                     },
-                    feedback: currentStudentFeedback
+                    feedback: currentStudentFeedback,
+                    review: currentStudentReview
                 });
             });
         }
@@ -787,13 +800,19 @@ exports.getFeedbackDetails = async (req, res) => {
 
         const imageObjects = await Promise.all(images.map(async (img) => {
             let displayUrl = null;
+            if (img.is_public === false) {
+                try {
+                    // S3 서비스 함수 호출
+                    displayUrl = await s3Service.generatePresignedGetUrl(img.file_key);
+                } catch (s3Error) {
+                    console.error(`Error getting presigned URL for feedback image ${img.file_key} from s3Service:`, s3Error);
+                    // URL 생성 실패 시 어떻게 처리할지 결정 (예: null 유지, 기본 이미지 URL 등)
+                }
 
-            try {
-                // S3 서비스 함수 호출
-                displayUrl = await s3Service.generatePresignedGetUrl(img.file_key);
-            } catch (s3Error) {
-                console.error(`Error getting presigned URL for feedback image ${img.file_key} from s3Service:`, s3Error);
-                // URL 생성 실패 시 어떻게 처리할지 결정 (예: null 유지, 기본 이미지 URL 등)
+            } else { // Public 파일
+                const bucket = process.env.UPLOAD_BUCKET;
+                const region = process.env.AWS_REGION;
+                displayUrl = `https://${bucket}.s3.${region}.amazonaws.com/${img.file_key}`;
             }
 
             return {
@@ -1136,5 +1155,316 @@ exports.getClassById = async (req, res) => {
     } catch (err) {
         console.error('수업 상세 조회 오류:', err);
         res.status(500).json({ message: '서버 오류로 수업 조회에 실패했습니다.' });
+    }
+};
+
+exports.approveFeedbackPublication = async (req, res) => {
+    const { feedbackId } = req.params;
+    const studentUserId = req.user.id; // 현재 로그인한 학생의 ID
+
+    const t = await ClassFeedback.sequelize.transaction(); // 트랜잭션 시작
+
+    try {
+        const feedback = await ClassFeedback.findByPk(feedbackId, { transaction: t });
+
+        if (!feedback) {
+            await t.rollback();
+            return res.status(404).json({ message: '피드백을 찾을 수 없습니다.' });
+        }
+
+        // 1. 권한 검증: 이 피드백이 현재 로그인한 학생의 것인지 확인
+        if (feedback.user_id !== studentUserId) {
+            await t.rollback();
+            return res.status(403).json({ message: '자신의 피드백에 대해서만 이 작업을 수행할 수 있습니다.' });
+        }
+
+        // 2. 상태 검증: 강사의 공개 요청이 있었고, 아직 승인/거절되지 않은 상태인지 확인
+        if (feedback.is_publication_requested !== true) {
+            await t.rollback();
+            return res.status(400).json({ message: '강사의 공개 요청이 없었거나 이미 처리된 요청입니다.' });
+        }
+        if (feedback.publish_approved || feedback.publish_rejected) {
+            await t.rollback();
+            return res.status(400).json({ message: '이미 공개 승인 또는 거절 처리된 피드백입니다.' });
+        }
+
+        // 3. 피드백 상태 업데이트: 공개 승인
+        feedback.publish_approved = true;
+        feedback.publish_approved_at = new Date();
+        feedback.is_public = true; // 최종적으로 공개 상태로 변경
+        feedback.is_publication_requested = false; // 요청 상태는 '처리됨'으로 변경 (선택적, 정책에 따라 true 유지 가능)
+        feedback.publish_rejected = false; // 혹시 모를 이전 거절 상태 초기화
+        feedback.reject_reason = null;   // 거절 사유 초기화
+
+        await feedback.save({ transaction: t });
+        await t.commit(); // 모든 작업 성공 시 트랜잭션 커밋
+
+        res.status(200).json({ message: '피드백 공개를 성공적으로 승인했습니다.', feedback });
+
+    } catch (err) {
+        if (t && !t.finished) { // 트랜잭션이 아직 완료되지 않았다면 롤백
+            try { await t.rollback(); } catch (rbError) { console.error('Rollback error on approving feedback publication:', rbError); }
+        }
+        console.error('피드백 공개 승인 오류:', err);
+        res.status(500).json({ message: '서버 오류로 인해 피드백 공개 승인에 실패했습니다.' });
+    }
+};
+
+/**
+ * 학생이 피드백 공개를 거절합니다.
+ */
+exports.rejectFeedbackPublication = async (req, res) => {
+    const { feedbackId } = req.params;
+    const studentUserId = req.user.id;
+    const { reject_reason } = req.body; // 프론트에서 거절 사유를 받을 수 있도록 (선택 사항)
+
+    const t = await ClassFeedback.sequelize.transaction(); // 트랜잭션 시작
+
+    try {
+        const feedback = await ClassFeedback.findByPk(feedbackId, { transaction: t });
+
+        if (!feedback) {
+            await t.rollback();
+            return res.status(404).json({ message: '피드백을 찾을 수 없습니다.' });
+        }
+
+        // 1. 권한 검증: 이 피드백이 현재 로그인한 학생의 것인지 확인
+        if (feedback.user_id !== studentUserId) {
+            await t.rollback();
+            return res.status(403).json({ message: '자신의 피드백에 대해서만 이 작업을 수행할 수 있습니다.' });
+        }
+
+        // 2. 상태 검증: 강사의 공개 요청이 있었고, 아직 승인/거절되지 않은 상태인지 확인
+        if (feedback.is_publication_requested !== true) {
+            await t.rollback();
+            return res.status(400).json({ message: '강사의 공개 요청이 없었거나 이미 처리된 요청입니다.' });
+        }
+        if (feedback.publish_approved || feedback.publish_rejected) {
+            await t.rollback();
+            return res.status(400).json({ message: '이미 공개 승인 또는 거절 처리된 피드백입니다.' });
+        }
+
+        // 3. 피드백 상태 업데이트: 공개 거절
+        feedback.publish_rejected = true;
+        feedback.publish_rejected_at = new Date();
+        feedback.is_public = false; // 공개되지 않음
+        feedback.is_publication_requested = false; // 요청 상태는 '처리됨'으로 변경
+        feedback.publish_approved = false; // 혹시 모를 이전 승인 상태 초기화
+        if (reject_reason !== undefined) { // 거절 사유가 전달된 경우에만 업데이트
+            feedback.reject_reason = reject_reason;
+        }
+
+        await feedback.save({ transaction: t });
+        await t.commit(); // 모든 작업 성공 시 트랜잭션 커밋
+
+        res.status(200).json({ message: '피드백 공개를 거절했습니다.', feedback });
+
+    } catch (err) {
+        if (t && !t.finished) { // 트랜잭션이 아직 완료되지 않았다면 롤백
+            try { await t.rollback(); } catch (rbError) { console.error('Rollback error on rejecting feedback publication:', rbError); }
+        }
+        console.error('피드백 공개 거절 오류:', err);
+        res.status(500).json({ message: '서버 오류로 인해 피드백 공개 거절에 실패했습니다.' });
+    }
+};
+
+exports.getMyReviewForClass = async (req, res) => {
+    const { classId } = req.params;
+    const studentUserId = req.user.id; // 인증된 학생의 ID
+
+    if (!classId) {
+        return res.status(400).json({ message: '수업 ID(classId)는 필수입니다.' });
+    }
+
+    try {
+        const review = await ClassReview.findOne({
+            where: {
+                class_id: Number(classId),
+                user_id: studentUserId
+            },
+            // 필요한 모든 필드를 가져옵니다.
+            // attributes: ['id', 'rating', 'review_text', 'is_public', 'created_at', 'updated_at'],
+            // 만약 User나 Class 정보를 여기서 함께 보여주고 싶다면 include 사용
+            // include: [
+            //     { model: User, as: 'user', attributes: ['name'] },
+            //     { model: Class, as: 'class', attributes: ['title'] }
+            // ]
+        });
+
+        if (!review) {
+            // 학생이 아직 이 수업에 대한 리뷰를 작성하지 않은 경우
+            return res.status(404).json({ message: '아직 이 수업에 대한 후기를 작성하지 않았습니다.' });
+        }
+
+        // 리뷰에 첨부된 이미지 파일 정보 조회 및 URL 생성
+        const images = await UploadFile.findAll({
+            where: {
+                target_type: 'review', // ClassReview에 연결된 파일의 target_type
+                target_id: review.id     // 현재 조회된 review의 ID
+            },
+            attributes: ['id', 'file_key', 'file_name', 'is_public']
+        });
+
+        const imageObjects = await Promise.all(images.map(async (img) => {
+            let displayUrl = null;
+            // 리뷰 이미지가 private일 경우 Pre-signed URL 생성 (정책에 따라 is_public 확인)
+            // 여기서는 모든 리뷰 이미지가 사용자 설정(img.is_public)을 따른다고 가정
+            if (img.is_public === false) {
+                try {
+                    displayUrl = await s3Service.generatePresignedGetUrl(img.file_key);
+                } catch (s3Error) {
+                    console.error(`Error generating presigned URL for review image ${img.file_key}:`, s3Error);
+                }
+            } else { // Public 파일
+                const bucket = process.env.UPLOAD_BUCKET;
+                const region = process.env.AWS_REGION;
+                displayUrl = `https://${bucket}.s3.${region}.amazonaws.com/${img.file_key}`;
+            }
+            return {
+                id: img.id,
+                file_key: img.file_key,
+                name: img.file_name,
+                url: displayUrl,
+                // MultiImageUploader의 initialFiles에 필요한 다른 속성도 포함 가능
+            };
+        }));
+
+        // Sequelize 인스턴스를 일반 객체로 변환하고 이미지 정보 추가
+        const responseData = {
+            ...review.get({ plain: true }),
+            images: imageObjects
+        };
+
+        res.status(200).json(responseData);
+
+    } catch (err) {
+        console.error('내 리뷰 조회 오류:', err);
+        res.status(500).json({ message: '서버 오류로 리뷰 조회에 실패했습니다.' });
+    }
+};
+
+/**
+ * 학생이 특정 수업에 대한 리뷰를 새로 작성합니다.
+ */
+exports.createClassReview = async (req, res) => {
+    const {
+        class_id,
+        rating,
+        review_text,
+        is_public = false, // 기본값은 비공개
+        file_keys = []     // 첨부된 이미지 파일들의 키 배열
+    } = req.body;
+
+    const studentUserId = req.user.id; // 현재 로그인한 학생의 ID
+    const now = new Date();
+
+    // Sequelize 트랜잭션 시작
+    // ClassReview 모델이 sequelize 인스턴스를 가지고 있다고 가정합니다.
+    // 만약 그렇지 않다면, db.sequelize.transaction() 등으로 sequelize 인스턴스를 직접 사용해야 합니다.
+    const t = await ClassReview.sequelize.transaction();
+
+    try {
+        // 1. 필수 값 검증
+        if (!class_id || !studentUserId) {
+            await t.rollback();
+            return res.status(400).json({ message: '수업 ID와 사용자 ID는 필수입니다.' });
+        }
+        if (rating === undefined || rating === null || rating < 1 || rating > 5) {
+            await t.rollback();
+            return res.status(400).json({ message: '평점은 1에서 5 사이의 값이어야 합니다.' });
+        }
+        if (!review_text || review_text.trim() === '') { // 리뷰 내용은 필수라고 가정
+            await t.rollback();
+            return res.status(400).json({ message: '리뷰 내용을 입력해주세요.' });
+        }
+
+        // 2. 수업(Class) 존재 및 종료 여부 확인
+        const targetClass = await Class.findByPk(class_id, { transaction: t });
+        if (!targetClass) {
+            await t.rollback();
+            return res.status(404).json({ message: '리뷰를 작성할 수업을 찾을 수 없습니다.' });
+        }
+        // (정책) 수업이 종료된 후에만 리뷰를 작성할 수 있도록 제한
+        if (targetClass.end_datetime && new Date(targetClass.end_datetime) > now) {
+            await t.rollback();
+            return res.status(403).json({ message: '수업이 종료된 후에 후기를 작성할 수 있습니다.' });
+        }
+
+        // 3. 학생이 해당 수업에 실제로 참여(예약 승인)했는지 확인
+        const reservation = await ClassReservation.findOne({
+            where: {
+                class_id: Number(class_id),
+                user_id: studentUserId,
+                status: { [Op.in]: ['approved', 'applied', 'cancel_request'] }
+            },
+            transaction: t
+        });
+        if (!reservation) {
+            await t.rollback();
+            return res.status(403).json({ message: '해당 수업을 수강한 학생만 후기를 작성할 수 있습니다.' });
+        }
+
+        // 4. 중복 리뷰 작성 방지 (ClassReview 모델의 UNIQUE 제약조건이 처리하지만, API 레벨에서도 확인)
+        const existingReview = await ClassReview.findOne({
+            where: {
+                class_id: Number(class_id),
+                user_id: studentUserId
+            },
+            transaction: t
+        });
+        if (existingReview) {
+            await t.rollback();
+            return res.status(409).json({ message: '이미 이 수업에 대한 후기를 작성하셨습니다. 기존 후기를 수정해주세요.' });
+        }
+
+        // 5. ClassReview 레코드 생성
+        const newReview = await ClassReview.create({
+            class_id: Number(class_id),
+            user_id: studentUserId,
+            rating: Number(rating),
+            review_text: review_text,
+            is_public: Boolean(false) // boolean 값으로 확실히 변환
+        }, { transaction: t });
+
+        // 6. 첨부된 이미지 파일 연결 (UploadFile 테이블 업데이트)
+        if (file_keys && file_keys.length > 0) {
+            await UploadFile.update(
+                {
+                    target_id: newReview.id,
+                    target_type: 'review' // UploadFile 테이블에서 리뷰 이미지를 식별하는 타입
+                },
+                {
+                    where: {
+                        file_key: { [Op.in]: file_keys },
+                        // 업로드 시점에 user_id와 임시 target_type 등으로 저장했다면, 그 조건도 추가 가능
+                    },
+                    transaction: t
+                }
+            );
+        }
+
+        await t.commit(); // 모든 작업 성공 시 트랜잭션 커밋
+
+        // 생성된 리뷰 객체 전체 또는 주요 정보 반환
+        res.status(201).json({
+            message: '후기가 성공적으로 작성되었습니다.',
+            reviewId: newReview.id,
+            review: newReview // 프론트에서 바로 상태 업데이트에 활용 가능
+        });
+
+    } catch (err) {
+        // 롤백은 트랜잭션이 아직 완료(커밋 또는 롤백)되지 않았을 때만 시도
+        if (t && !t.finished) {
+            try {
+                await t.rollback();
+            } catch (rbError) {
+                console.error('Rollback error on creating review:', rbError);
+            }
+        }
+        console.error('리뷰 생성 오류:', err);
+        if (err.name === 'SequelizeUniqueConstraintError') { // (class_id, user_id) 중복 오류
+            return res.status(409).json({ message: '이미 이 수업에 대한 후기를 작성하셨습니다.' });
+        }
+        res.status(500).json({ message: '서버 오류로 인해 후기 작성에 실패했습니다.' });
     }
 };

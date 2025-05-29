@@ -98,6 +98,65 @@ const checkUploadPermission = async (req, res, next) => {
       }
     }
 
+    if (target_type === 'review' && ['gallery'].includes(purpose)) {
+      // 1. 기본 권한: 학생(user)만 리뷰 이미지 업로드 가능
+      if (user.userType !== 'user') {
+        return res.status(403).json({ message: '학생만 리뷰 이미지를 업로드할 수 있습니다.' });
+      }
+
+      // 2. target_id (review_id)가 있는 경우 (기존 리뷰에 이미지 추가/수정 시)
+      if (target_id) {
+        const review = await ClassReview.findByPk(target_id);
+        if (!review) {
+          return res.status(404).json({ message: '리뷰 정보를 찾을 수 없습니다.' });
+        }
+        // 본인 리뷰에만 이미지 업로드 가능
+        if (review.user_id !== user.id) {
+          return res.status(403).json({ message: '자신의 리뷰에만 이미지를 업로드할 수 있습니다.' });
+        }
+
+        // 해당 리뷰가 속한 수업 정보 확인
+        const targetClassForReview = await Class.findByPk(review.class_id);
+        if (!targetClassForReview) {
+          return res.status(404).json({ message: '리뷰에 연결된 수업 정보를 찾을 수 없습니다.' });
+        }
+        // 수업 종료 후 리뷰 이미지 업로드 가능 (정책에 따라)
+        if (targetClassForReview.end_datetime && new Date(targetClassForReview.end_datetime) > now) {
+          return res.status(403).json({ message: '수업 종료 후 리뷰 관련 이미지를 업로드할 수 있습니다.' });
+        }
+        // 해당 학생이 수업에 참여했는지 확인
+        const reservation = await ClassReservation.findOne({
+          where: { class_id: review.class_id, user_id: user.id, status: 'approved' }
+        });
+        if (!reservation) {
+          return res.status(403).json({ message: '해당 수업을 수강한 학생만 리뷰 이미지를 업로드할 수 있습니다.' });
+        }
+        return next(); // 모든 검증 통과 (수정 시)
+      } else {
+        // // target_id가 없는 경우 (새 리뷰 작성 중 이미지 업로드):
+        // // 프론트에서 class_id를 보내줘야 함 (req.body.class_id)
+        // if (!class_id) {
+        //   return res.status(400).json({ message: '새 리뷰 이미지 업로드 시 대상 수업(class_id) 정보가 필요합니다.' });
+        // }
+        // const targetClassForNewReview = await Class.findByPk(class_id);
+        // if (!targetClassForNewReview) {
+        //   return res.status(404).json({ message: '리뷰를 작성할 수업을 찾을 수 없습니다.' });
+        // }
+        // // 수업 종료 후 리뷰 이미지 업로드 가능 (정책에 따라)
+        // if (targetClassForNewReview.end_datetime && new Date(targetClassForNewReview.end_datetime) > now) {
+        //   return res.status(403).json({ message: '수업 종료 후 리뷰 관련 이미지를 업로드할 수 있습니다.' });
+        // }
+        // // 해당 학생이 수업에 참여했는지 확인
+        // const reservationForNewReview = await ClassReservation.findOne({
+        //   where: { class_id: Number(class_id), user_id: user.id, status: 'approved' }
+        // });
+        // if (!reservationForNewReview) {
+        //   return res.status(403).json({ message: '해당 수업을 수강한 학생만 리뷰 이미지를 업로드할 수 있습니다.' });
+        // }
+        return next(); // 생성 시 기본 검증 통과
+      }
+    }
+
     return res.status(403).json({ message: '지원하지 않는 업로드 요청이거나 파일 업로드 권한이 없습니다.' });
 
 
@@ -175,7 +234,7 @@ const validateReservationTransition = async (req, res, next) => {
   const reservation = await ClassReservation.findByPk(reservationId, {
     include: [{
       model: Class,
-      as: 'class', 
+      as: 'class',
       attributes: ['start_datetime', 'is_reservation_closed']
     }]
   });
