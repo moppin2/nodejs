@@ -13,7 +13,7 @@ const s3 = new S3Client({
   }
 });
 
-const generatePresignedUploadUrl = async (req, res) => {
+const generatePresignedUploadUrl = async (req, res) => {  //preSignedURL만 생성
   try {
     let { target_type, purpose, file_type, extension, is_public } = req.body;
 

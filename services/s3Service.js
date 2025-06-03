@@ -18,7 +18,7 @@ const UPLOAD_BUCKET = process.env.UPLOAD_BUCKET; // .env 파일 등에서 S3 버
  * @param {number} expiresInSeconds - URL 유효 시간 (초 단위, 기본값: 1시간)
  * @returns {Promise<string>} Pre-signed URL
  */
-async function generatePresignedGetUrl(fileKey) {
+async function generatePresignedGetUrl(fileKey, expiresInSeconds = 300) {
     if (!fileKey) {
         throw new Error('fileKey is required to generate a pre-signed GET URL.');
     }

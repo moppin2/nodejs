@@ -50,11 +50,15 @@ exports.upsertClass = async (req, res) => {
 };
 
 exports.getMyClassList = async (req, res) => {
+
     try {
         const now = new Date();
         const { id: userId, userType } = req.user;
         const instructor_id = userType === 'instructor' ? userId : undefined;
         const student_id = userType === 'user' ? userId : undefined;
+        const { classId: classIdFromParams } = req.params;
+
+        let whereClause = {};
 
         // 1) 공통 include: Course → Instructor, License
         const include = [{
@@ -89,7 +93,7 @@ exports.getMyClassList = async (req, res) => {
             });
 
             // b) 학생 전용 whereClause: 시작 전·예약 마감 전 & (내 예약 있거나 수강 중인 과정)
-            var whereClause = {
+            whereClause = {
                 [Op.or]: [
                     // 1) 내 예약(언제든지)
                     { '$reservations.user_id$': student_id },
@@ -105,8 +109,10 @@ exports.getMyClassList = async (req, res) => {
         }
 
         // 3) 강사 모드 whereClause: 별도 필요 없음 (include.where로 필터링)
-        if (instructor_id) {
-            var whereClause = {};
+
+
+        if (classIdFromParams) {
+            whereClause.id = classIdFromParams; // Class 모델의 기본키가 'id'라고 가정
         }
 
         // 4) 조회
@@ -288,7 +294,12 @@ exports.getMyClassList = async (req, res) => {
                 title: c.title,
                 start_datetime: c.start_datetime,
                 end_datetime: c.end_datetime,
+                location: c.location,
                 capacity: c.capacity,
+                description: c.description,
+                materials: c.materials,
+                additional_fees: c.additional_fees,
+                is_reservation_closed: c.is_reservation_closed,
                 reserved_count: totalReserved,
                 status,
                 instructor: {
@@ -336,6 +347,247 @@ exports.getMyClassList = async (req, res) => {
     catch (err) {
         console.error('getMyClassList error:', err);
         return res.status(500).json({ error: err.message });
+    }
+};
+
+exports.getClassDetail = async (req, res) => {
+    const { classId } = req.params;
+    const now = new Date();
+
+    try {
+        // 1. 기본 수업 정보 및 관련 과정, 강사, 라이선스 정보 조회
+        const targetClass = await Class.findByPk(classId, {
+            include: [{
+                model: Course,
+                as: 'course',
+                attributes: ['id', 'title', 'license_id', 'instructor_id'],
+                include: [
+                    { model: Instructor, as: 'instructor', attributes: ['id', 'name'] },
+                    { model: License, as: 'license', attributes: ['association', 'name'] }
+                ],
+                required: true
+            }],
+        });
+
+        if (!targetClass) {
+            return res.status(404).json({ message: '수업을 찾을 수 없습니다.' });
+        }
+
+        // 3. 후처리 데이터 준비
+        // 3a. 예약 건수
+        const reservationCounts = await ClassReservation.findAll({
+            attributes: ['status', [fn('COUNT', col('id')), 'count']],
+            where: { class_id: targetClass.id, status: { [Op.in]: ['applied', 'approved', 'cancel_request'] } },
+            group: ['status'], raw: true
+        });
+        const currentClassCountMap = {};
+        reservationCounts.forEach(r => { currentClassCountMap[r.status] = parseInt(r.count, 10); });
+        const totalReserved = ['applied', 'approved', 'cancel_request']
+            .reduce((sum, s) => sum + (currentClassCountMap[s] || 0), 0);
+
+        // 3b. 강사 아바타
+        let instructorAvatarUrl = null;
+        if (targetClass.course.instructor_id) {
+            const instructorAvatarFile = await UploadFile.findOne({
+                where: { target_type: 'instructor', target_id: targetClass.course.instructor_id, purpose: 'profile', is_public: true }
+            });
+            const bucket = process.env.UPLOAD_BUCKET;
+            if (instructorAvatarFile) {
+                instructorAvatarUrl = `https://${bucket}.s3.amazonaws.com/${instructorAvatarFile.file_key}`;
+            }
+        }
+
+        // 3c. 수업 상태
+        let classStatus;
+        const classStartDate = new Date(targetClass.start_datetime);
+        const classEndDate = new Date(targetClass.end_datetime);
+        if (now < classStartDate) {
+            classStatus = totalReserved < targetClass.capacity ? 'reserved_open' : 'reserved_closed';
+        } else if (now <= classEndDate) {
+            classStatus = 'in_progress';
+        } else {
+            classStatus = 'completed';
+        }
+
+        // 3d. 이 수업의 모든 예약 정보
+        const allReservationsForThisClass = await ClassReservation.findAll({
+            where: { class_id: targetClass.id },
+            include: [{ model: User, as: 'user', attributes: ['id', 'name'] }],
+            order: [['created_at', 'ASC']]
+        });
+
+        const studentIdsInClass = allReservationsForThisClass.map(r => r.user_id).filter(id => id != null);
+        const studentFeedbackMap = {};
+        const studentReviewMap = {};
+        const publicFeedbackIds = [];
+        const publicReviewIds = [];
+
+        if (studentIdsInClass.length > 0) {
+            const feedbackAttributes = [ /* ... (이전과 동일한 필드 목록) ... */
+                'id', 'feedback_text', 'rating', 'is_public', 'class_id', 'user_id',
+                'is_publication_requested', 'publish_requested_at',
+                'publish_approved', 'publish_approved_at',
+                'publish_rejected', 'publish_rejected_at', 'reject_reason'
+            ];
+            const allFeedbacksForStudents = await ClassFeedback.findAll({
+                where: { class_id: targetClass.id, user_id: { [Op.in]: studentIdsInClass } },
+                attributes: feedbackAttributes
+            });
+            allFeedbacksForStudents.forEach(fb => {
+                const feedbackData = fb.get({ plain: true });
+                studentFeedbackMap[`u${fb.user_id}`] = feedbackData;
+                if (feedbackData.is_public) {
+                    publicFeedbackIds.push(feedbackData.id);
+                }
+            });
+
+            const reviewAttributes = ['id', 'class_id', 'user_id', 'rating', 'review_text', 'is_public'];
+            const allReviewsForStudents = await ClassReview.findAll({
+                where: { class_id: targetClass.id, user_id: { [Op.in]: studentIdsInClass } },
+                attributes: reviewAttributes
+            });
+            allReviewsForStudents.forEach(rv => {
+                const reviewData = rv.get({ plain: true });
+                studentReviewMap[`u${rv.user_id}`] = reviewData;
+                if (reviewData.is_public) {
+                    publicReviewIds.push(reviewData.id);
+                }
+            });
+        }
+
+        // 3e. 공개된 피드백/리뷰의 이미지들만 URL 생성
+        const feedbackImageMap = {};
+        const reviewImageMap = {};
+        const bucket = process.env.UPLOAD_BUCKET; // .env 등에서 설정
+
+        if (publicFeedbackIds.length > 0) {
+            const feedbackImages = await UploadFile.findAll({
+                where: { target_type: 'feedback', target_id: { [Op.in]: publicFeedbackIds } },
+                attributes: ['id', 'file_key', 'file_name', 'target_id']
+            });
+            for (const img of feedbackImages) {
+                if (!feedbackImageMap[img.target_id]) feedbackImageMap[img.target_id] = [];
+                try {
+                    const url = await s3Service.generatePresignedGetUrl(img.file_key, 3600);
+                    feedbackImageMap[img.target_id].push({ id: img.id, file_key: img.file_key, name: img.file_name, url });
+                } catch (e) { console.error(e); }
+            }
+        }
+        if (publicReviewIds.length > 0) {
+            const reviewImages = await UploadFile.findAll({
+                where: { target_type: 'review', target_id: { [Op.in]: publicReviewIds } },
+                attributes: ['id', 'file_key', 'file_name', 'target_id']
+            });
+            for (const img of reviewImages) {
+                if (!reviewImageMap[img.target_id]) reviewImageMap[img.target_id] = [];
+                try {
+                    const url = await s3Service.generatePresignedGetUrl(img.file_key);
+                    reviewImageMap[img.target_id].push({ id: img.id, file_key: img.file_key, name: img.file_name, url });
+                } catch (e) { console.error(e); }
+            }
+        }
+
+        // 학생 아바타 (기존 로직)
+        const studentAvatarMap = {};
+        if (studentIdsInClass.length > 0) {
+            const studentAvatarFiles = await UploadFile.findAll({
+                where: { target_type: 'user', target_id: { [Op.in]: studentIdsInClass }, purpose: 'profile', is_public: true }
+            });
+            studentAvatarFiles.forEach(f => { studentAvatarMap[f.target_id] = `https://${bucket}.s3.amazonaws.com/${f.file_key}`; });
+        }
+
+        // 예약 목록 상세 구성
+        const reservationsDetails = allReservationsForThisClass.map(rInstance => {
+            const r = rInstance.get({ plain: true });
+            let effectiveStatus = r.status;
+            if (now >= classStartDate) {
+                if (r.status === 'applied') effectiveStatus = 'approved';
+                if (r.status === 'cancel_request') effectiveStatus = 'approved';
+            }
+
+            let processedFeedback = null;
+            const originalFeedback = studentFeedbackMap[`u${r.user_id}`];
+            if (originalFeedback) {
+                if (originalFeedback.is_public) {
+                    processedFeedback = { ...originalFeedback, images: feedbackImageMap[originalFeedback.id] || [] };
+                } else { // 비공개 피드백: 상태 정보만
+                    processedFeedback = {
+                        id: originalFeedback.id,
+                        class_id: originalFeedback.class_id,
+                        user_id: originalFeedback.user_id,
+                        is_public: false,
+                        is_publication_requested: originalFeedback.is_publication_requested,
+                        publish_requested_at: originalFeedback.publish_requested_at,
+                        publish_approved: originalFeedback.publish_approved,
+                        publish_approved_at: originalFeedback.publish_approved_at,
+                        publish_rejected: originalFeedback.publish_rejected,
+                        publish_rejected_at: originalFeedback.publish_rejected_at,
+                        reject_reason: originalFeedback.reject_reason,
+                        // feedback_text, rating 등은 제외
+                        images: []
+                    };
+                }
+            }
+
+            let processedReview = null;
+            const originalReview = studentReviewMap[`u${r.user_id}`];
+            if (originalReview) {
+                if (originalReview.is_public) {
+                    processedReview = { ...originalReview, images: reviewImageMap[originalReview.id] || [] };
+                } else { // 비공개 리뷰: id와 is_public만
+                    processedReview = {
+                        id: originalReview.id,
+                        is_public: false,
+                        // review_text, rating 등은 제외
+                        images: []
+                    };
+                }
+            }
+
+            return {
+                id: r.id,
+                status: effectiveStatus,
+                user: r.user ? {
+                    id: r.user.id, name: r.user.name, userType: 'user',
+                    avatarUrl: studentAvatarMap[r.user.id] || null
+                } : null,
+                feedback: processedFeedback,
+                review: processedReview
+            };
+        });
+
+        // 4. 최종 결과 객체 조립
+        const result = {
+            id: targetClass.id,
+            title: targetClass.title,
+            start_datetime: targetClass.start_datetime,
+            end_datetime: targetClass.end_datetime,
+            capacity: targetClass.capacity,
+            description: targetClass.description,
+            location: targetClass.location,
+            materials: targetClass.materials,
+            additional_fees: targetClass.additional_fees,
+            is_reservation_closed: targetClass.is_reservation_closed,
+            course_id: targetClass.course.id,
+            course_title: targetClass.course.title,
+            instructor: {
+                id: targetClass.course.instructor_id,
+                name: targetClass.course.instructor?.name || '',
+                userType: 'instructor',
+                avatarUrl: instructorAvatarUrl
+            },
+            license_association: targetClass.course.license?.association || '',
+            license_name: targetClass.course.license?.name || '',
+            reserved_count: totalReserved,
+            status: classStatus,
+            reservations: reservationsDetails
+        };
+
+        res.status(200).json(result);
+
+    } catch (err) {
+        console.error(`수업 상세(강사용) 조회 오류 (Class ID: ${classId}):`, err);
+        res.status(500).json({ message: '서버 오류로 수업 상세 정보 조회에 실패했습니다.' });
     }
 };
 
@@ -737,7 +989,7 @@ exports.updateFeedback = async (req, res) => {
 
 exports.getFeedbackDetails = async (req, res) => {
     const { feedbackId } = req.params;
-    const requestingUser = req.user; // { id, userType, status }
+    const requestingUser = req.user; // { id, userType, status } 
 
     try {
         const feedback = await ClassFeedback.findByPk(feedbackId, {
@@ -1423,7 +1675,7 @@ exports.createClassReview = async (req, res) => {
             user_id: studentUserId,
             rating: Number(rating),
             review_text: review_text,
-            is_public: Boolean(false) // boolean 값으로 확실히 변환
+            is_public: Boolean(is_public) // boolean 값으로 확실히 변환
         }, { transaction: t });
 
         // 6. 첨부된 이미지 파일 연결 (UploadFile 테이블 업데이트)

@@ -6,7 +6,7 @@ const { permissionGuard, validateReservationTransition } = require('../middlewar
 
 router.post('/api/class', authenticateToken, permissionGuard({ allowedRoles: ['instructor'], allowedStatus: ['approved'] }), classController.upsertClass);
 router.get('/api/class/:classId', authenticateToken, permissionGuard({ allowedRoles: ['instructor', 'user'], allowedStatus: ['approved'] }), classController.getClassById);
-router.get('/api/myclasses', authenticateToken, classController.getMyClassList);
+router.get('/api/myclasses/:classId?', authenticateToken, classController.getMyClassList);
 router.post('/api/class-reservations', authenticateToken, permissionGuard({ allowedRoles: ['user'] }), classController.createReservation);
 router.patch('/api/class-reservations/:id/status',
     authenticateToken, permissionGuard({ allowedRoles: ['user', 'instructor'], allowedStatus: ['approved'] }), validateReservationTransition, classController.changeReservationStatus);
@@ -20,5 +20,5 @@ router.put('/api/class-feedbacks/:feedbackId/reject-publication', authenticateTo
 router.get('/api/course-progress', classController.getCourseProgressWithStatus);
 router.get('/api/classes/:classId/my-review', authenticateToken, permissionGuard({ allowedRoles: ['user'] }), classController.getMyReviewForClass);
 router.post('/api/class-reviews', authenticateToken, permissionGuard({ allowedRoles: ['user'] }), classController.createClassReview);
+router.get('/api/class-detail/:classId', classController.getClassDetail);
 module.exports = router;
-
