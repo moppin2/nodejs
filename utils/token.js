@@ -17,7 +17,7 @@ function signAccessToken(user) {
     payload.status = user.status;
   }
 
-  return jwt.sign(payload, ACCESS_SECRET, { expiresIn: '5m' });
+  return jwt.sign(payload, ACCESS_SECRET, { expiresIn: '15m' });
 }
 
 function signRefreshToken(user) {

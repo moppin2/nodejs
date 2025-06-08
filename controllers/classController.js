@@ -1,18 +1,22 @@
 const { Class, Course, Instructor, License, ClassReservation, CourseCompletionCriteria, StudentCourseProgress,
-    UploadFile, User, ClassFeedback, ClassReview, CourseApplication, ClassReservationHistory } = require('../models');
+    UploadFile, User, ClassFeedback, ClassReview, CourseApplication, ClassReservationHistory,
+    ChatRoom, ChatRoomParticipant, ChatMessage, sequelize, Sequelize } = require('../models');
 const { Op, fn, col } = require('sequelize');
 const s3Service = require('../services/s3Service');
 
 exports.upsertClass = async (req, res) => {
+    const t = await sequelize.transaction(); // 트랜잭션 사용
     try {
         const data = req.body;
         const instructorId = req.user.id; // 로그인된 강사 ID
 
         // 1) 과정 소유권 검증 (없으면 403)
         const course = await Course.findOne({
-            where: { id: data.course_id, instructor_id: instructorId }
+            where: { id: data.course_id, instructor_id: instructorId },
+            transaction: t,
         });
         if (!course) {
+            await t.rollback();
             return res.status(403).json({ error: '해당 과정에 대한 권한이 없습니다.' });
         }
 
@@ -21,33 +25,55 @@ exports.upsertClass = async (req, res) => {
             const start = new Date(data.start_datetime);
             const end = new Date(data.end_datetime);
             if (end <= start) {
-                return res
-                    .status(400)
-                    .json({ error: '종료 일시는 시작 일시보다 이후여야 합니다.' });
+                await t.rollback();
+                return res.status(400).json({ error: '종료 일시는 시작 일시보다 이후여야 합니다.' });
             }
         }
 
-        // 2) 수정 모드: data.id가 있으면 해당 수업 찾고, 없으면 404
+        let cls;
+
+        // 2) 수정 모드
         if (data.id) {
-            const cls = await Class.findOne({
-                where: { id: data.id, course_id: data.course_id }
+            cls = await Class.findOne({
+                where: { id: data.id, course_id: data.course_id },
+                transaction: t,
             });
             if (!cls) {
+                await t.rollback();
                 return res.status(404).json({ error: '수업을 찾을 수 없습니다.' });
             }
-            await cls.update(data);
+            await cls.update(data, { transaction: t });
+            await t.commit();
             return res.json(cls);
         }
 
-        // 3) 생성 모드: 바로 생성
-        const cls = await Class.create(data);
+        // 3) 생성 모드
+        cls = await Class.create(data, { transaction: t });
+
+        // 3.1) 채팅방 생성
+        const chatRoom = await ChatRoom.create({
+            room_type: 'class',
+            related_class_id: cls.id,
+            title: `${course.title} - ${cls.title || '수업'} 채팅방`,
+        }, { transaction: t });
+
+        // 3.2) 강사를 참가자로 등록
+        await ChatRoomParticipant.create({
+            chat_room_id: chatRoom.id,
+            user_type: 'instructor',
+            user_id: instructorId,
+        }, { transaction: t });
+
+        await t.commit();
         return res.json(cls);
 
     } catch (err) {
+        if (t) await t.rollback();
         console.error('Class upsert error:', err);
         return res.status(500).json({ error: err.message });
     }
 };
+
 
 exports.getMyClassList = async (req, res) => {
 
@@ -591,125 +617,181 @@ exports.getClassDetail = async (req, res) => {
     }
 };
 
-
 exports.createReservation = async (req, res) => {
+    const t = await sequelize.transaction();
     try {
         const userId = req.user.id;
         const { class_id } = req.body;
 
         // 1) 해당 Class 존재 여부 확인
-        const cls = await Class.findByPk(class_id);
+        const cls = await Class.findByPk(class_id, { transaction: t });
         if (!cls) {
+            await t.rollback();
             return res.status(404).json({ message: '해당 수업을 찾을 수 없습니다.' });
         }
 
-
+        // 2) 예약 마감 여부 및 시작 시간 확인
         if (new Date() >= cls.start_datetime || cls.is_reservation_closed === true) {
-            return res.status(400).json({ message: '예약마감 이후에는 예약 할 수 없습니다.' });
+            await t.rollback();
+            return res.status(400).json({ message: '예약 마감 이후에는 예약 할 수 없습니다.' });
         }
 
-        // ——— 여기서 “정원 초과” 체크 ———
+        // 3) “정원 초과” 체크
         const totalRequests = await ClassReservation.count({
             where: {
                 class_id,
                 status: { [Op.in]: ['applied', 'approved', 'cancel_request'] }
-            }
+            },
+            transaction: t,
         });
         if (totalRequests >= cls.capacity) {
+            await t.rollback();
             return res.status(400).json({ message: '예약 정원이 가득 찼습니다.' });
         }
-        // ————————————————————————
 
-        // 2) 사용자가 그 Course에 수강(승인) 상태인지 확인
+        // 4) 사용자가 해당 Course에 승인된 상태인지 확인
         const hasCourse = await CourseApplication.findOne({
             where: {
                 course_id: cls.course_id,
                 user_id: userId,
-                status: 'approved'         // 또는 여러분이 쓰는 승인 상태값
-            }
+                status: 'approved'
+            },
+            transaction: t,
         });
         if (!hasCourse) {
+            await t.rollback();
             return res.status(403).json({ message: '수강중인 과정의 수업만 예약할 수 있습니다.' });
         }
 
-        // 3) 기존 예약 조회
-        const existing = await ClassReservation.findOne({
-            where: { class_id, user_id: userId }
+        // 5) 기존 예약 조회
+        let reservation = await ClassReservation.findOne({
+            where: { class_id, user_id: userId },
+            transaction: t,
         });
 
-        let reservation;
-        if (existing) {
-            // 거절 상태, 취소상태였다면 다시 신청으로
-            if (existing.status === 'rejected' || existing.status === 'cancelled') {
-                existing.status = 'applied';
-                await existing.save();
-                reservation = existing;
+        if (reservation) {
+            // 이미 존재하는 예약이 있고, 거절 또는 취소 상태였다면 다시 신청으로 전환
+            if (['rejected', 'cancelled'].includes(reservation.status)) {
+                reservation.status = 'applied';
+                await reservation.save({ transaction: t });
             } else {
+                await t.rollback();
                 return res.status(400).json({ message: '이미 예약 상태입니다.' });
             }
         } else {
-            // 4) 신규 예약 생성
+            // 6) 신규 예약 생성
             reservation = await ClassReservation.create({
                 class_id,
                 user_id: userId
-            });
+            }, { transaction: t });
         }
 
-        // 5) 이력 기록
+        // 7) 예약 이력 기록
         await ClassReservationHistory.create({
             reservation_id: reservation.id,
             action: 'apply',
             performed_by: userId,
             performer_type: 'user',
             reason: null
+        }, { transaction: t });
+
+        // 8) 채팅방 참가자 자동 등록
+        //    - 클래스가 생성될 때 ChatRoom이 이미 만들어진 상태라고 가정
+        const chatRoom = await ChatRoom.findOne({
+            where: { room_type: 'class', related_class_id: cls.id },
+            transaction: t,
         });
 
+        if (chatRoom) {
+            await ChatRoomParticipant.findOrCreate({
+                where: {
+                    chat_room_id: chatRoom.id,
+                    user_type: 'user',
+                    user_id: userId
+                },
+                defaults: {
+                    joined_at: new Date()
+                },
+                transaction: t,
+            });
+        }
+
+        // 모든 작업 성공 시 커밋
+        await t.commit();
         return res.status(201).json(reservation);
+
     } catch (err) {
+        // 오류 시 롤백
+        await t.rollback();
         console.error('createReservation error:', err);
         return res.status(500).json({ message: '서버 오류로 예약에 실패했습니다.' });
     }
 };
 
 exports.changeReservationStatus = async (req, res) => {
-    try {
-        const reservation = req.reservation;
-        const { action } = req.body;
-        const { id: userId, userType } = req.user;
+  const t = await sequelize.transaction();
+  try {
+    const reservation = req.reservation;
+    const { action } = req.body;
+    const { id: performerId, userType: performerType } = req.user;
 
-        const statusMap = {
-            approve: 'approved',
-            reject: 'rejected',
-            cancel: 'cancelled',
-            cancel_request: 'cancel_request',
-            cancel_approve: 'cancelled',
-            cancel_deny: 'approved',    // approved 상태에서만 cancel_request 가능함
-        };
+    const statusMap = {
+      approve: 'approved',
+      reject: 'rejected',
+      cancel: 'cancelled',
+      cancel_request: 'cancel_request',
+      cancel_approve: 'cancelled',
+      cancel_deny: 'approved',
+    };
 
-        const newStatus = statusMap[action];
-        if (!newStatus) {
-            throw new Error(`알 수 없는 액션: ${action}`);
-        }
-
-
-        // 상태 업데이트
-        reservation.status = newStatus;
-        await reservation.save();
-
-        // 이력 기록
-        await ClassReservationHistory.create({
-            reservation_id: reservation.id,
-            action: action,
-            performed_by: userId,
-            performer_type: userType,
-            reason: req.body.reason || null
-        });
-
-        res.json(reservation);
-    } catch (err) {
-        console.error('changeReservationStatus error:', err);
-        res.status(500).json({ message: '서버 오류로 상태 변경에 실패했습니다.' });
+    const newStatus = statusMap[action];
+    if (!newStatus) {
+      await t.rollback();
+      throw new Error(`알 수 없는 액션: ${action}`);
     }
+
+    // 1) 상태 업데이트
+    reservation.status = newStatus;
+    await reservation.save({ transaction: t });
+
+    // 2) 이력 기록
+    await ClassReservationHistory.create({
+      reservation_id: reservation.id,
+      action,
+      performed_by: performerId,
+      performer_type: performerType,
+      reason: req.body.reason || null,
+    }, { transaction: t });
+
+    // 3) 'rejected' 또는 'cancelled' 상태라면 채팅방에서 해당 학생(user) 제거
+    if (newStatus === 'rejected' || newStatus === 'cancelled') {
+      const classId = reservation.class_id;
+
+      const chatRoom = await ChatRoom.findOne({
+        where: { room_type: 'class', related_class_id: classId },
+        transaction: t,
+      });
+
+      if (chatRoom) {
+        await ChatRoomParticipant.destroy({
+          where: {
+            chat_room_id: chatRoom.id,
+            user_type: 'user',
+            user_id: reservation.user_id, // 거절되거나 취소된 학생 ID
+          },
+          transaction: t,
+        });
+      }
+    }
+
+    await t.commit();
+    return res.json(reservation);
+
+  } catch (err) {
+    await t.rollback();
+    console.error('changeReservationStatus error:', err);
+    return res.status(500).json({ message: '서버 오류로 상태 변경에 실패했습니다.' });
+  }
 };
 
 exports.createFeedback = async (req, res) => {

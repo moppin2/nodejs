@@ -1,9 +1,9 @@
 const { Sequelize, DataTypes } = require('sequelize');
 const sequelize = new Sequelize('mydb', 'root', '2331', {
-  host: 'localhost',
-  port: 3306,
-  dialect: 'mysql',
-  logging: false
+    host: 'localhost',
+    port: 3306,
+    dialect: 'mysql',
+    logging: false
 });
 
 const db = {};
@@ -20,7 +20,7 @@ db.CourseCompletionCriteria = require('./CourseCompletionCriteria')(sequelize, D
 // 수업 관련 모델
 db.Class = require('./Class')(sequelize, DataTypes);
 db.ClassReservation = require('./ClassReservation')(sequelize, DataTypes);
-db.ClassReservationHistory = require('./ClassReservationHistory')(sequelize, DataTypes); 
+db.ClassReservationHistory = require('./ClassReservationHistory')(sequelize, DataTypes);
 db.ClassFeedback = require('./ClassFeedback')(sequelize, DataTypes);
 db.ClassReview = require('./ClassReview')(sequelize, DataTypes);
 
@@ -33,6 +33,10 @@ db.InstructorVerificationHistory = require('./InstructorVerificationHistory')(se
 db.CourseApplication = require('./CourseApplication')(sequelize, DataTypes);
 db.CourseApplicationHistory = require('./CourseApplicationHistory')(sequelize, DataTypes);
 db.StudentCourseProgress = require('./StudentCourseProgress')(sequelize, DataTypes);
+// 채팅 관련 모델
+db.ChatRoom = require('./ChatRoom')(sequelize, DataTypes);
+db.ChatRoomParticipant = require('./ChatRoomParticipant')(sequelize, DataTypes);
+db.ChatMessage = require('./ChatMessage')(sequelize, DataTypes);
 
 // 관계 정의
 // Instructor - Course
@@ -97,7 +101,7 @@ db.CourseCompletionCriteria.hasMany(db.StudentCourseProgress, {
     foreignKey: 'criterion_id',
     as: 'progressRecords' // 이 수료 기준을 통과한 학생들의 기록
 });
-db.StudentCourseProgress.belongsTo(db.CourseCompletionCriteria, {
+db.StudentCourseProgress.belongsTo(db.CourseCompletionCriteria, { 
     foreignKey: 'criterion_id',
     as: 'criterion'
 });
@@ -111,5 +115,19 @@ db.StudentCourseProgress.belongsTo(db.Class, {
     foreignKey: 'class_id',
     as: 'classWherePassed' // 어느 수업에서 통과했는지
 });
+
+// ChatRoom 관계
+db.ChatRoom.hasMany(db.ChatRoomParticipant, { foreignKey: 'chat_room_id', as: 'participants' });
+db.ChatRoom.hasMany(db.ChatMessage, { foreignKey: 'chat_room_id', as: 'messages' });
+
+// ChatRoomParticipant 관계
+db.ChatRoomParticipant.belongsTo(db.ChatRoom, { foreignKey: 'chat_room_id', as: 'chatRoom' });
+
+// ChatMessage 관계
+db.ChatMessage.belongsTo(db.ChatRoom, { foreignKey: 'chat_room_id', as: 'chatRoom' });
+
+db.ChatRoom.belongsTo(db.Course, { foreignKey: 'related_course_id', as: 'relatedCourse' });
+db.ChatRoom.belongsTo(db.Class, { foreignKey: 'related_class_id', as: 'relatedClass' });
+
 
 module.exports = db;

@@ -1,191 +1,217 @@
 const jwt = require('jsonwebtoken');
-const { signAccessToken, signRefreshToken } = require('../utils/token');
-const { REFRESH_SECRET, COOKIE_SECURE } = require('../config');
-
+const { signAccessToken, signRefreshToken } = require('../utils/token'); // 가정: 이 유틸리티 함수들이 존재
+const { REFRESH_SECRET, COOKIE_SECURE, ACCESS_SECRET } = require('../config'); // ACCESS_SECRET도 config에 있다고 가정
 const bcrypt = require('bcrypt');
-const { User, Instructor, Admin, RefreshToken, InstructorVerificationHistory } = require('../models');
-const { UploadFile } = require('../models');
+const { User, Instructor, Admin, RefreshToken, InstructorVerificationHistory, UploadFile } = require('../models');
 const { Op } = require('sequelize');
 
-exports.login = async (req, res) => {
-  try {
-    const { userType, email, password } = req.body; 
+// 내부 로그인 처리 함수 (회원가입 후에도 호출됨)
+const handleLoginAndSetCookies = async (req, res, userInstance) => {
+  const userPayloadForToken = {
+    id: userInstance.id,
+    userType: userInstance.userType,
+    name: userInstance.name, // name을 페이로드에 포함
+    email: userInstance.email,
+    status: userInstance.status,
+  };
 
-    let user = null;
+  const accessToken = signAccessToken(userPayloadForToken);
+  const refreshToken = signRefreshToken({ id: userInstance.id, userType: userInstance.userType });
+  const socketToken = signAccessToken(userPayloadForToken); // Socket.IO용 토큰
 
-    if (userType === 'user') {
-      user = await User.findOne({ where: { email } });
-    } else if (userType === 'instructor') {
-      user = await Instructor.findOne({ where: { email } });
-    } else if (userType === 'admin') {
-      user = await Admin.findOne({ where: { email } });
-    } else {
-      return res.status(400).json({ message: '잘못된 사용자 유형입니다.' });
-    }
-
-    if (!user) {
-      return res.status(401).json({ message: '존재하지 않는 사용자입니다.' });
-    }
-
-    const passwordMatch = await bcrypt.compare(password, user.pwd_hash);
-
-    if (!passwordMatch) {
-      return res.status(401).json({ message: '비밀번호가 일치하지 않습니다.' });
-    }
-
-    user.userType = userType;
-    user.username = user.name;    
-
-  const avatarFile = await UploadFile.findOne({
-    where: {
-      target_type: userType,
-      target_id: user.id,
-      purpose: 'profile',
-      is_public: true,   // 필요 없으면 제거하세요
-    }
-  });
-  
-  const bucket = process.env.UPLOAD_BUCKET;
-  user.avatarUrl = avatarFile?.file_key ? `https://${bucket}.s3.amazonaws.com/${avatarFile.file_key}` : null;
-
-    const accessToken = signAccessToken(user);      // 토큰 생성 시 userType도 포함되게 하면 좋음
-    const refreshToken = signRefreshToken(user);
-
-    await RefreshToken.upsert({
-      user_id: user.id,
-      user_type: userType,
-      token: refreshToken,
-      user_agent: req.headers['user-agent'],
-      ip_address: req.ip,
-      expires_at: new Date(Date.now() + 7 * 24 * 60 * 60 * 1000) // 7일 후
-    });
-
-    res
-      .cookie('accessToken', accessToken, { httpOnly: true, secure: COOKIE_SECURE, sameSite: 'Lax', maxAge: 5 * 60 * 1000 })
-      .cookie('refreshToken', refreshToken, { httpOnly: true, secure: COOKIE_SECURE, sameSite: 'Lax', maxAge: 7 * 24 * 60 * 60 * 1000 })
-      .json({ userType, id: user.id, email: user.email, username: user.name, avatarUrl: user.avatarUrl, status: user.status });
-
-  } catch (err) {
-    console.error(err);
-    res.status(500).json({ message: '서버 오류가 발생했습니다.' });
-  }
-};
-
-exports.refresh = async (req, res) => {
-  const token = req.cookies.refreshToken;
-  if (!token) return res.status(401).json({ message: 'Refresh token 없음' });
-
-  let payload;
-  try {
-    payload = jwt.verify(token, REFRESH_SECRET);
-  } catch (err) {
-    return res.status(403).json({ message: 'Refresh token 유효하지 않음' });
-  }
-
-  const { id, userType } = payload;
-
-  // 1. DB에 저장된 토큰 확인
-  const storedToken = await RefreshToken.findOne({
-    where: { user_id: id, user_type: userType, token }
-  });
-
-  if (!storedToken) return res.status(403).json({ message: 'DB에 저장된 토큰이 아님' });
-  if (new Date() > storedToken.expires_at) return res.status(403).json({ message: '토큰 만료됨' });
-
-  // 2. 사용자 정보 조회 (access token용 payload 복원)
-  let user;
-  if (userType === 'user') {
-    user = await User.findByPk(id);
-  } else if (userType === 'instructor') {
-    user = await Instructor.findByPk(id);
-  } else if (userType === 'admin') {
-    user = await Admin.findByPk(id);
-  }
-
-  if (!user) return res.status(404).json({ message: '사용자 없음' });
-
-  const avatarFile = await UploadFile.findOne({
-    where: {
-      target_type: userType,
-      target_id: user.id,
-      purpose: 'profile',
-      is_public: true,   // 필요 없으면 제거하세요
-    }
-  });
-  
-  const bucket = process.env.UPLOAD_BUCKET;
-  user.avatarUrl = avatarFile?.file_key ? `https://${bucket}.s3.amazonaws.com/${avatarFile.file_key}` : null;
-
-  // 3. 새 토큰 발급
-  const newAccess = signAccessToken({
-    id: user.id,
-    userType,
-    username: user.name,
-    email: user.email,
-    avatarUrl: user.avatarUrl,
-    status: user.status,
-  });
-
-  const newRefresh = signRefreshToken({ id: user.id, userType });
-
-  // 4. DB 갱신
-  const found = await RefreshToken.findOne({ where: { token } });
-
-  const deleted = await RefreshToken.destroy({
-    where: { user_id: user.id, user_type: userType, token: token }
-  });
-  await RefreshToken.create({
-    user_id: user.id,
-    user_type: userType,
-    token: newRefresh,
+  await RefreshToken.upsert({
+    user_id: userInstance.id,
+    user_type: userInstance.userType,
+    token: refreshToken,
     user_agent: req.headers['user-agent'],
     ip_address: req.ip,
     expires_at: new Date(Date.now() + 7 * 24 * 60 * 60 * 1000)
   });
 
-  // 5. 클라이언트에 토큰 전달
   res
-    .cookie('accessToken', newAccess, { httpOnly: true, sameSite: 'Lax', maxAge: 5 * 60 * 1000 })
-    .cookie('refreshToken', newRefresh, { httpOnly: true, sameSite: 'Lax', maxAge: 7 * 24 * 60 * 60 * 1000 })
-    .sendStatus(200);
+    .cookie('accessToken', accessToken, { httpOnly: true, secure: COOKIE_SECURE, sameSite: 'Lax', maxAge: 5 * 60 * 1000 })
+    .cookie('refreshToken', refreshToken, { httpOnly: true, secure: COOKIE_SECURE, sameSite: 'Lax', maxAge: 7 * 24 * 60 * 60 * 1000 })
+    .status(userInstance.isNewRecord ? 201 : 200)
+    .json({
+      id: userInstance.id,
+      userType: userInstance.userType,
+      username: userInstance.name, // 프론트에서 username으로 사용한다면 name을 username으로 매핑
+      name: userInstance.name,     // name 필드도 명시적으로 전달
+      email: userInstance.email,
+      avatarUrl: userInstance.avatarUrl || null,
+      status: userInstance.status,
+      socketToken: socketToken,
+      message: userInstance.isNewRecord ? '회원가입 및 로그인 성공' : '로그인 성공'
+    });
+};
+
+
+exports.login = async (req, res) => {
+  try {
+    const { userType, email, password } = req.body;
+    let userModel;
+    switch (userType) {
+      case 'user': userModel = User; break;
+      case 'instructor': userModel = Instructor; break;
+      case 'admin': userModel = Admin; break;
+      default: return res.status(400).json({ message: '잘못된 사용자 유형입니다.' });
+    }
+
+    const user = await userModel.findOne({ where: { email } });
+    if (!user) {
+      return res.status(401).json({ message: '존재하지 않는 사용자이거나 이메일 또는 비밀번호가 잘못되었습니다.' });
+    }
+
+    const passwordMatch = await bcrypt.compare(password, user.pwd_hash);
+    if (!passwordMatch) {
+      return res.status(401).json({ message: '존재하지 않는 사용자이거나 이메일 또는 비밀번호가 잘못되었습니다.' });
+    }
+
+    user.userType = userType; // 토큰 생성 및 응답에 필요
+
+    const avatarFile = await UploadFile.findOne({
+      where: { target_type: userType, target_id: user.id, purpose: 'profile', is_public: true }
+    });
+    const bucket = process.env.UPLOAD_BUCKET;
+    user.avatarUrl = avatarFile?.file_key ? `https://${bucket}.s3.amazonaws.com/${avatarFile.file_key}` : null;
+
+    user.isNewRecord = false;
+    await handleLoginAndSetCookies(req, res, user);
+
+  } catch (err) {
+    console.error('Login error:', err);
+    res.status(500).json({ message: '서버 오류가 발생했습니다.' });
+  }
+};
+
+exports.refresh = async (req, res) => {
+  const incomingRefreshToken = req.cookies.refreshToken;
+  if (!incomingRefreshToken) return res.status(401).json({ message: 'Refresh token이 제공되지 않았습니다.' });
+
+  let payload;
+  try {
+    payload = jwt.verify(incomingRefreshToken, REFRESH_SECRET);
+  } catch (err) {
+    return res.status(403).json({ message: 'Refresh token이 유효하지 않습니다 (만료 또는 변조).' });
+  }
+
+  const { id, userType } = payload;
+
+  const storedTokenRecord = await RefreshToken.findOne({
+    where: { user_id: id, user_type: userType, token: incomingRefreshToken }
+  });
+
+  if (!storedTokenRecord) {
+    return res.status(403).json({ message: '유효하지 않거나 탈취된 Refresh token 입니다.' });
+  }
+  if (new Date() > new Date(storedTokenRecord.expires_at)) {
+    await storedTokenRecord.destroy();
+    return res.status(403).json({ message: 'Refresh token이 만료되었습니다.' });
+  }
+
+  let userInstance; // 변수명 변경 (user -> userInstance)
+  let userModel;
+  switch (userType) {
+    case 'user': userModel = User; break;
+    case 'instructor': userModel = Instructor; break;
+    case 'admin': userModel = Admin; break;
+    default: return res.status(400).json({ message: '잘못된 사용자 유형입니다.' });
+  }
+  userInstance = await userModel.findByPk(id);
+
+  if (!userInstance) {
+    await storedTokenRecord.destroy();
+    return res.status(404).json({ message: '사용자를 찾을 수 없습니다.' });
+  }
+
+  const avatarFile = await UploadFile.findOne({
+    where: {
+      target_type: userType,
+      target_id: userInstance.id,
+      purpose: 'profile',
+      is_public: true,   // 필요 없으면 제거하세요
+    }
+  });
+
+  const bucket = process.env.UPLOAD_BUCKET;
+  userInstance.avatarUrl = avatarFile?.file_key ? `https://${bucket}.s3.amazonaws.com/${avatarFile.file_key}` : null;
+
+  // Access Token 페이로드에 필요한 정보 구성
+  const userPayloadForToken = {
+    id: userInstance.id,
+    userType,
+    username: userInstance.name, // DB에서 가져온 최신 이름 사용
+    email: userInstance.email, // DB에서 가져온 최신 이메일 사용
+    avatarUrl: userInstance.avatarUrl,
+    status: userInstance.status
+  };
+  const newAccessToken = signAccessToken(userPayloadForToken);
+  const newRefreshToken = signRefreshToken({ id: userInstance.id, userType });
+
+  await storedTokenRecord.destroy();
+  await RefreshToken.create({
+    user_id: userInstance.id,
+    user_type: userType,
+    token: newRefreshToken,
+    user_agent: req.headers['user-agent'],
+    ip_address: req.ip,
+    expires_at: new Date(Date.now() + 7 * 24 * 60 * 60 * 1000)
+  });
+
+  res
+    .cookie('accessToken', newAccessToken, { path: '/', httpOnly: true, secure: COOKIE_SECURE, sameSite: 'Lax', maxAge: 5 * 60 * 1000 })
+    .cookie('refreshToken', newRefreshToken, { path: '/', httpOnly: true, secure: COOKIE_SECURE, sameSite: 'Lax', maxAge: 7 * 24 * 60 * 60 * 1000 })
+    .status(200)
+    .json({
+      message: 'Tokens refreshed successfully',
+      accessToken: newAccessToken
+    });
 };
 
 exports.logout = async (req, res) => {
-
+  // ... (기존 로그아웃 로직)
   const token = req.cookies.refreshToken;
-  if (!token) {
-    return res
-      .clearCookie('accessToken')
-      .clearCookie('refreshToken')
-      .sendStatus(200); // 쿠키만 지우고 끝
-  }
-
-  try {
-    const payload = jwt.verify(token, REFRESH_SECRET);
-    const { id, userType } = payload;
-
-    // DB에서 refresh token 삭제
-    await RefreshToken.destroy({
-      where: {
-        user_id: id,
-        user_type: userType,
-        token
+  if (token) {
+    try {
+      const payload = jwt.verify(token, REFRESH_SECRET);
+      if (payload && payload.id && payload.userType) {
+        await RefreshToken.destroy({
+          where: { user_id: payload.id, user_type: payload.userType, token }
+        });
       }
-    });
-  } catch (err) {
-    // 유효하지 않은 토큰이더라도 쿠키는 삭제
-    console.error('logout error:', err.message);
+    } catch (err) {
+      console.error('Logout: Error verifying refresh token:', err.message);
+    }
   }
-
-  // 쿠키 삭제
   res
-    .clearCookie('accessToken')
-    .clearCookie('refreshToken')
-    .sendStatus(200);
+    .clearCookie('accessToken', { httpOnly: true, secure: COOKIE_SECURE, sameSite: 'Lax' })
+    .clearCookie('refreshToken', { httpOnly: true, secure: COOKIE_SECURE, sameSite: 'Lax' })
+    .status(200)
+    .json({ message: '성공적으로 로그아웃되었습니다.' });
 };
 
-exports.me = (req, res) => {
-  res.json(req.user);
+exports.me = async (req, res) => {
+  // authenticateToken 미들웨어에서 req.user를 설정한다고 가정
+  // req.user는 Access Token 페이로드에서 온 정보 { id, userType, name, email, status }
+  if (!req.user || !req.user.id || !req.user.userType) {
+    return res.status(401).json({ message: '인증되지 않았거나 유효하지 않은 토큰입니다.' });
+  }
+
+  // Socket.IO 인증을 위한 새 토큰 생성 (Access Token과 동일한 정보로)
+  // 이 토큰은 클라이언트 JavaScript가 접근 가능해야 함
+  const socketToken = signAccessToken(req.user);
+
+  res.json({
+    // user 객체 형태로 한 번 더 감싸서 보낼 수도 있음: user: { ...userForResponse, socketToken }
+    // 또는 바로 필요한 필드들을 보냄
+    id: req.user.id,
+    userType: req.user.userType,
+    username: req.user.username,
+    email: req.user.email,
+    avatarUrl: req.user.avatarUrl,
+    status: req.user.status,
+    socketToken: socketToken // <<--- 소켓 인증용 토큰 추가
+  });
 };
 
 exports.registerUser = async (req, res) => {
@@ -197,15 +223,17 @@ exports.registerUser = async (req, res) => {
     const pwd_hash = await bcrypt.hash(password, 10);
     const user = await User.create({ email, pwd_hash, name, phone_number: phone });
 
-    user.userType = 'user'; // ✅ 토큰 발급용
-    await login(req, res, user); // ✅ 로그인 처리
+    user.userType = 'user';
+    user.isNewRecord = true;
+    user.avatarUrl = null;
+    user.status = 'active';
 
-    // return res.status(201).json({ message: '회원가입 성공', userId: user.id });
+    await handleLoginAndSetCookies(req, res, user);
+
   } catch (err) {
-    console.error(err);
-    res.status(500).json({ message: '서버 오류' });
+    console.error('User registration error:', err);
+    res.status(500).json({ message: '서버 오류로 회원가입에 실패했습니다.' });
   }
-
 };
 
 exports.registerInstructor = async (req, res) => {
@@ -216,61 +244,24 @@ exports.registerInstructor = async (req, res) => {
 
     const pwd_hash = await bcrypt.hash(password, 10);
     const instructor = await Instructor.create({
-      email,
-      pwd_hash,
-      name,
-      phone_number: phone,
-      career_years: careerYears,
-      main_experience: majorCareer,
-      comment: introduction,
-      joined_at: new Date().toISOString()
+      email, pwd_hash, name, phone_number: phone,
+      career_years: careerYears, main_experience: majorCareer,
+      comment: introduction, joined_at: new Date().toISOString(),
+      status: 'draft'
     });
 
     instructor.userType = 'instructor';
-    instructor.status = 'draft';
-    await login(req, res, instructor); // ✅ 로그인 처리
+    instructor.isNewRecord = true;
+    instructor.avatarUrl = null;
+
+    await handleLoginAndSetCookies(req, res, instructor);
+
   } catch (err) {
-    console.error(err);
-    res.status(500).json({ message: '서버 오류' });
+    console.error('Instructor registration error:', err);
+    res.status(500).json({ message: '서버 오류로 회원가입에 실패했습니다.' });
   }
 };
 
-const login = async (req, res, user) => {
-  const accessToken = signAccessToken(user);
-  const refreshToken = signRefreshToken(user);
-
-  await RefreshToken.upsert({
-    user_id: user.id,
-    user_type: user.userType,
-    token: refreshToken,
-    user_agent: req.headers['user-agent'],
-    ip_address: req.ip,
-    expires_at: new Date(Date.now() + 7 * 24 * 60 * 60 * 1000) // 7일
-  });
-
-  res
-    .cookie('accessToken', accessToken, {
-      httpOnly: true,
-      secure: COOKIE_SECURE,
-      sameSite: 'Lax',
-      maxAge: 5 * 60 * 1000
-    })
-    .cookie('refreshToken', refreshToken, {
-      httpOnly: true,
-      secure: COOKIE_SECURE,
-      sameSite: 'Lax',
-      maxAge: 7 * 24 * 60 * 60 * 1000
-    })
-    .status(201)
-    .json({
-      message: '회원가입 및 로그인 성공',
-      userType: user.userType,
-      id: user.id,
-      email: user.email,
-      username: user.name,
-      status: user.status
-    });
-};
 
 resetInstructorVerificationFiles = async (instructor_id, file_keys = []) => {
   // 1. 기존 연결 해제

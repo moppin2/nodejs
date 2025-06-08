@@ -1,9 +1,10 @@
 const express = require('express');
+const http = require('http');
 const cookieParser = require('cookie-parser');
 const cors = require('cors');
-const { PORT, CLIENT_URL } = require('./config');
-
+const { PORT, CLIENT_URL, ACCESS_SECRET } = require('./config');
 const db = require('./models')
+const setupSocketIO = require('./socketSetup');
 
 const authRoutes = require('./routes/authRoutes');
 const userRoutes = require('./routes/userRoutes');
@@ -13,8 +14,10 @@ const classRoutes = require('./routes/classRoutes');
 const codeRoutes = require('./routes/codeRoutes');
 const fileRoutes = require('./routes/fileRoutes');
 const licenseRoutes = require('./routes/licenseRoutes');
+const chatRoutes = require('./routes/chatRoutes');
 
 const app = express();
+const httpServer = http.createServer(app);
 
 
 // ***************운영반영 시 원복***************
@@ -44,8 +47,8 @@ const corsOptions = {
     callback(new Error('Not allowed by CORS'));
   },
   credentials: true,            // 쿠키 전송이 필요하면 true
-  methods: ['GET','POST','PATCH','PUT','DELETE','OPTIONS'],
-  allowedHeaders: ['Content-Type','Authorization']
+  methods: ['GET', 'POST', 'PATCH', 'PUT', 'DELETE', 'OPTIONS'],
+  allowedHeaders: ['Content-Type', 'Authorization']
 };
 
 // ③ 모든 라우트에 CORS 적용
@@ -68,6 +71,9 @@ app.use('/', classRoutes);
 app.use('/', codeRoutes);
 app.use('/', fileRoutes);
 app.use('/', licenseRoutes);
+app.use('/api/chat', chatRoutes);
+
+const io = setupSocketIO(httpServer, ACCESS_SECRET); // JWT_SECRET_KEY 전달
 
 // ✅ 서버 실행 전에 DB 동기화
 (async () => {
@@ -77,8 +83,11 @@ app.use('/', licenseRoutes);
     await db.sequelize.sync({ force: false }); // 개발 중에만 true 가능
     console.log('✅ Sequelize 모델과 DB 동기화 완료');
 
-    app.listen(PORT, () => {
-      console.log(`🚀 Server running on http://localhost:${PORT}`);
+    // app.listen(PORT, () => {
+    //   console.log(`🚀 Server running on http://localhost:${PORT}`);
+
+    httpServer.listen(PORT, () => { // Express 앱(app)이 아닌 httpServer를 리스닝
+      console.log(`🚀 Server (HTTP & Socket.IO) running on http://localhost:${PORT}`);
     });
   } catch (err) {
     console.error('❌ 서버 실행 실패:', err);
