@@ -1,10 +1,17 @@
-const { ChatRoom, ChatRoomParticipant, ChatMessage } = require('./models');
+const { ChatRoom, ChatRoomParticipant, ChatMessage, FcmToken } = require('./models');
 const cookie = require('cookie');
 const { Server } = require("socket.io");
 const authService = require('./services/authService');
+const admin = require('firebase-admin');
+const { getMessaging } = require('firebase-admin/messaging');
+const serviceAccount = require('./config/serviceAccountKey.json');
+
+admin.initializeApp({
+  credential: admin.credential.cert(serviceAccount),
+});
 
 function setupSocketIO(httpServer, jwtSecret) {
-    const io = new Server(httpServer, { //서버 시작 시 한 번 실행됨됨
+    const io = new Server(httpServer, { //서버 시작 시 한 번 실행됨
         cors: {
             origin: process.env.CLIENT_URL || "http://localhost:3000", // 클라이언트 주소
             methods: ["GET", "POST"],
@@ -89,6 +96,7 @@ function setupSocketIO(httpServer, jwtSecret) {
         socket.on('send_chat_message', async (data) => {
             try {
                 const { roomId, content, senderId, message_type = 'text' } = data;
+                const sender = socket.user; // { id, userType }
 
                 // 1) DB에 메시지 저장
                 const saved = await ChatMessage.create({
@@ -116,6 +124,46 @@ function setupSocketIO(httpServer, jwtSecret) {
                 };
                 // const payload = data;
                 io.to(roomId).emit('new_chat_message', payload);
+
+                // 3) FCM 푸시 발송: 같은 룸의 다른 참가자들 대상
+                //    - ChatRoomParticipant에서 roomId 참가자 조회
+                //    - 참가자의 FCM 토큰 목록 조회
+                const participants = await ChatRoomParticipant.findAll({
+                    where: { chat_room_id: roomId }
+                });
+
+                // 토큰 배열 수집 (본인은 제외)
+                const tokens = [];
+                for (const p of participants) {
+                    if (p.user_type === sender.userType && p.user_id === sender.id) continue;
+
+                    const userTokens = await FcmToken.findAll({
+                        where: {
+                            user_id: p.user_id,
+                            user_type: p.user_type
+                        }
+                    });
+                    userTokens.forEach(t => tokens.push(t.fcm_token));
+                }
+
+                if (tokens.length > 0) {
+                    // 푸시 메시지 구성
+                    const message = {
+                        notification: {
+                            title: `새 채팅 메시지`,
+                            body: content.length > 50 ? content.slice(0, 47) + '...' : content,
+                        },
+                        data: {
+                            roomId: String(roomId),
+                            messageId: String(saved.id)
+                        },
+                        tokens: tokens
+                    };
+
+                    // 멀티캐스트 전송
+                    const response = await getMessaging().sendEachForMulticast(message);
+                    console.log(`FCM: ${response.successCount} 성공, ${response.failureCount} 실패`);
+                }
 
             } catch (err) {
                 console.error('send_chat_message error:', err);

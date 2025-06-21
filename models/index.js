@@ -37,6 +37,10 @@ db.StudentCourseProgress = require('./StudentCourseProgress')(sequelize, DataTyp
 db.ChatRoom = require('./ChatRoom')(sequelize, DataTypes);
 db.ChatRoomParticipant = require('./ChatRoomParticipant')(sequelize, DataTypes);
 db.ChatMessage = require('./ChatMessage')(sequelize, DataTypes);
+// Fcm Token 모델
+db.FcmToken = require('./FcmToken')(sequelize, DataTypes);
+
+
 
 // 관계 정의
 // Instructor - Course

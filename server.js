@@ -15,6 +15,7 @@ const codeRoutes = require('./routes/codeRoutes');
 const fileRoutes = require('./routes/fileRoutes');
 const licenseRoutes = require('./routes/licenseRoutes');
 const chatRoutes = require('./routes/chatRoutes');
+const fcmTokenRoutes = require('./routes/fcmTokenRoutes');
 
 const app = express();
 const httpServer = http.createServer(app);
@@ -72,6 +73,8 @@ app.use('/', codeRoutes);
 app.use('/', fileRoutes);
 app.use('/', licenseRoutes);
 app.use('/api/chat', chatRoutes);
+app.use('/api/fcm-token', fcmTokenRoutes);
+
 
 const io = setupSocketIO(httpServer, ACCESS_SECRET); // JWT_SECRET_KEY 전달
 

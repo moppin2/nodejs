@@ -1,6 +1,9 @@
 # node modules
 node_modules/
 
+# Firebase 서비스 계정 키
+config/serviceAccountKey.json
+
 # 환경 변수 파일
 .env
 
